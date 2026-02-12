@@ -56,18 +56,6 @@
 //!    `prettyplease`. Reconstructs `#[contracttype]` definitions,
 //!    `#[contracterror]` error enums, `#[contractimpl]` function bodies, and
 //!    the top-level `#[contract]` struct with appropriate `use` imports.
-//!
-//! # Modules
-//!
-//! | Module | Purpose |
-//! |--------|---------|
-//! | [`spec_extract`] | Contract specification extraction from WASM custom sections |
-//! | [`wasm_analysis`] | WASM binary parsing, dispatcher tracing, and stack simulation |
-//! | [`wasm_imports`] | WASM import table resolution against the host function database |
-//! | [`host_functions`] | Soroban host function database loaded from the bundled `env.json` |
-//! | [`ir`] | High-level intermediate representation bridging analysis and codegen |
-//! | [`pattern_recognizer`] | Host call sequence to SDK operation mapping |
-//! | [`codegen`] | Rust source code generation from IR |
 
 pub mod codegen;
 pub mod host_functions;
