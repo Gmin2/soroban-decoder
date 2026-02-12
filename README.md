@@ -6,6 +6,8 @@ Soroban contracts embed a `contractspecv0` custom section in the WASM binary tha
 
 The project is organized as a Rust workspace with two crates. The `soroban-decompiler` library crate implements the full decompilation pipeline and can be embedded in other tools. The `soroban-decompiler-cli` crate provides the `soroban-decompile` command-line binary for direct use.
 
+![architecture](./assets/archi.png)
+
 
 ## Architecture
 

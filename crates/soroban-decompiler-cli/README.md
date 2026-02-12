@@ -1,5 +1,7 @@
 # soroban-decompiler-cli
 
+![cli-image](../../assets/cli.png)
+
 Command-line tool for decompiling Soroban smart contracts from compiled WASM binaries back to readable Rust source code.
 
 This crate provides the `soroban-decompile` binary, which wraps the `soroban-decompiler` library. It supports full decompilation, signature-only extraction, contract spec inspection, host import resolution, WASM analysis, and low-level stack debugging. All output goes to stdout by default so it can be piped into other tools.
