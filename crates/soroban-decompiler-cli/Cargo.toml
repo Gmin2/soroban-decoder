@@ -1,0 +1,18 @@
+[package]
+name = "soroban-decompiler-cli"
+description = "CLI for decompiling Soroban WASM smart contracts back to Rust source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "soroban-decompile"
+path = "src/main.rs"
+
+[dependencies]
+soroban-decompiler = { workspace = true }
+stellar-xdr = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
