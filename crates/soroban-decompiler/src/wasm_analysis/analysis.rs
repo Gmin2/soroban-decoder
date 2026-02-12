@@ -13,12 +13,12 @@ use super::{AnalyzedModule, HostCallSite};
 
 /// Internal statistics collected from a function body traversal.
 #[derive(Default)]
-pub(super) struct FunctionBodyStats {
-    pub(super) host_calls: Vec<HostCallSite>,
-    pub(super) local_call_count: usize,
-    pub(super) has_branches: bool,
-    pub(super) has_loops: bool,
-    pub(super) instruction_count: usize,
+pub struct FunctionBodyStats {
+    pub host_calls: Vec<HostCallSite>,
+    pub local_call_count: usize,
+    pub has_branches: bool,
+    pub has_loops: bool,
+    pub instruction_count: usize,
 }
 
 /// Visitor that collects host calls, local calls, and control flow info.
@@ -90,7 +90,7 @@ impl AnalyzedModule {
     /// Each wrapper calls exactly one other local function. We follow this
     /// chain until we find a function that calls multiple local functions
     /// or calls host functions directly (indicating it's doing real work).
-    pub(super) fn trace_to_impl(&self, func_id: FunctionId) -> FunctionId {
+    pub fn trace_to_impl(&self, func_id: FunctionId) -> FunctionId {
         let mut current = func_id;
 
         for _ in 0..5 {
@@ -125,7 +125,7 @@ impl AnalyzedModule {
     }
 
     /// Collect detailed statistics about a function's body.
-    pub(super) fn analyze_function_body(&self, func_id: FunctionId) -> FunctionBodyStats {
+    pub fn analyze_function_body(&self, func_id: FunctionId) -> FunctionBodyStats {
         let func = self.module.funcs.get(func_id);
         let local_func = match &func.kind {
             FunctionKind::Local(lf) => lf,

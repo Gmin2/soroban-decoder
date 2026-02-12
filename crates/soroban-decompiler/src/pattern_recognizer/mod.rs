@@ -1,8 +1,30 @@
-/// Pattern recognition: maps WASM host call sequences to idiomatic Soroban SDK operations.
-///
-/// Takes tracked host calls (with resolved arguments from stack simulation) and
-/// the contract spec, then produces high-level IR statements that correspond to
-/// SDK method calls like `env.storage().persistent().get(...)`.
+//! Pattern recognition: maps WASM host call sequences to idiomatic Soroban SDK operations.
+//!
+//! This is the third stage of the decompilation pipeline. It takes the tracked
+//! host function calls (with resolved arguments from stack simulation) and the
+//! contract spec, then produces high-level [`crate::ir`] statements that
+//! correspond to SDK method calls like `env.storage().persistent().get(...)`.
+//!
+//! The recognition process runs in two passes:
+//!
+//! 1. **Name assignment** -- scans all host calls and assigns variable names
+//!    to let-binding results. Struct field names are resolved from map/vec
+//!    unpack operations using the WASM data section.
+//!
+//! 2. **Statement building** -- walks the analyzed block tree (preserving
+//!    if/else and loop structure) and converts each host call into an IR
+//!    statement using the names from the first pass.
+//!
+//! After both passes, the result goes through two optimization passes:
+//! common subexpression elimination and dead variable elimination.
+//!
+//! # Submodules
+//!
+//! - [`host_calls`] -- per-host-function pattern matching (storage, auth,
+//!   ledger, crypto, token, etc.)
+//! - [`val_decoding`] -- Soroban Val encoding/decoding, symbol resolution,
+//!   and expression resolution from stack values to IR expressions
+//! - [`optimization`] -- CSE, DCE, and variable renaming passes
 
 use std::collections::HashMap;
 
@@ -11,25 +33,25 @@ use stellar_xdr::curr::{ScSpecEntry, ScSpecFunctionV0};
 use crate::ir::{Expr, FunctionIR, Statement};
 use crate::wasm_analysis::{AnalyzedBlock, AnalyzedModule, StackValue, TrackedHostCall};
 
-mod host_calls;
-mod val_decoding;
-mod optimization;
+pub mod host_calls;
+pub mod val_decoding;
+pub mod optimization;
 
 pub use val_decoding::{
     strip_val_boilerplate, extract_u32_val, decode_keys_from_linear_memory,
 };
 
 /// Bundles all context needed during pattern recognition.
-pub(super) struct RecognitionContext<'a> {
-    pub(super) analyzed: &'a AnalyzedModule,
-    pub(super) all_entries: &'a [ScSpecEntry],
-    pub(super) param_names: Vec<String>,
-    pub(super) call_result_names: HashMap<usize, String>,
-    pub(super) memory_strings: HashMap<usize, String>,
-    pub(super) vec_contents: &'a HashMap<usize, Vec<StackValue>>,
-    pub(super) map_contents: &'a HashMap<usize, (Vec<String>, Vec<StackValue>)>,
+pub struct RecognitionContext<'a> {
+    pub analyzed: &'a AnalyzedModule,
+    pub all_entries: &'a [ScSpecEntry],
+    pub param_names: Vec<String>,
+    pub call_result_names: HashMap<usize, String>,
+    pub memory_strings: HashMap<usize, String>,
+    pub vec_contents: &'a HashMap<usize, Vec<StackValue>>,
+    pub map_contents: &'a HashMap<usize, (Vec<String>, Vec<StackValue>)>,
     #[allow(dead_code)]
-    pub(super) unpack_field_ids: &'a HashMap<usize, Vec<usize>>,
+    pub unpack_field_ids: &'a HashMap<usize, Vec<usize>>,
 }
 
 /// Recognize SDK patterns in a function's host calls and produce IR.

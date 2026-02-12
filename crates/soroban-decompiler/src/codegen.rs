@@ -1,3 +1,22 @@
+//! Rust source code generation from the decompiled IR.
+//!
+//! This is the final stage of the decompilation pipeline. It takes contract
+//! specification entries (for type definitions) and optionally an analyzed
+//! WASM module (for function bodies), produces a Rust token stream using
+//! `quote`, and formats it with `prettyplease`.
+//!
+//! The generated code includes:
+//!
+//! - `#![no_std]` and `use soroban_sdk::{...}` imports
+//! - `#[contracttype]` struct and enum definitions
+//! - `#[contracterror]` error enum definitions
+//! - `#[soroban_sdk::contractevent]` event struct definitions
+//! - `#[contract]` struct declaration
+//! - `#[contractimpl]` block with decompiled function bodies
+//!
+//! When no WASM analysis is provided (signatures-only mode), function bodies
+//! contain `todo!("body decompilation pending")` placeholders.
+
 use anyhow::Result;
 use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};

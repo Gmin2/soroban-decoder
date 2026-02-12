@@ -1,8 +1,32 @@
-/// WASM module analysis for Soroban contract decompilation.
-///
-/// Parses a WASM binary with walrus, resolves host function imports,
-/// traces through Soroban dispatcher chains to find implementation functions,
-/// and extracts structured analysis of each contract function's body.
+//! WASM module analysis for Soroban contract decompilation.
+//!
+//! This is the second stage of the decompilation pipeline. It parses a WASM
+//! binary with `walrus`, resolves host function imports against the bundled
+//! database, traces through Soroban dispatcher chains to find the real
+//! implementation functions, and simulates each function's stack to extract
+//! host call sequences with fully resolved arguments.
+//!
+//! The key types are:
+//!
+//! - [`AnalyzedModule`] -- the parsed WASM module with host function mappings.
+//!   This is the entry point for all analysis operations.
+//! - [`FunctionStackAnalysis`] -- the complete result of stack-simulating a
+//!   function body, including host calls, control flow blocks, memory state,
+//!   and decoded vec/map contents.
+//! - [`StackValue`] -- an abstract value tracked during stack simulation.
+//!   Values flow from parameters and constants through locals, memory, and
+//!   function calls, allowing the decompiler to resolve host call arguments
+//!   back to their origins.
+//!
+//! # Submodules
+//!
+//! - [`simulation`] -- the stack simulation engine that walks WASM
+//!   instructions and tracks values through the operand stack, local
+//!   variables, and memory
+//! - [`analysis`] -- dispatcher tracing and function body statistics
+//!   collection
+//! - [`helpers`] -- utility functions for value inspection, address
+//!   decomposition, memory decoding, and WASM operator mapping
 
 use std::collections::HashMap;
 
@@ -12,15 +36,15 @@ use walrus::ir;
 
 use crate::host_functions::{self, HostFunction};
 
-mod simulation;
-mod analysis;
-mod helpers;
+pub mod simulation;
+pub mod analysis;
+pub mod helpers;
 
 /// Analyzed WASM module with resolved host function mappings.
 pub struct AnalyzedModule {
-    pub(super) module: Module,
+    pub module: Module,
     /// Maps imported FunctionId → resolved HostFunction.
-    pub(super) host_func_map: HashMap<FunctionId, &'static HostFunction>,
+    pub host_func_map: HashMap<FunctionId, &'static HostFunction>,
 }
 
 /// Analysis results for a single exported contract function.

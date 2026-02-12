@@ -15,7 +15,7 @@ use super::{AnalyzedModule, StackValue};
 /// Keeps a local if both branches agree on the value, or if only
 /// one branch touched it. Removes locals where the two branches
 /// disagree.
-pub(super) fn merge_locals(
+pub fn merge_locals(
     cons_locals: &mut HashMap<LocalId, StackValue>,
     alt_locals: &HashMap<LocalId, StackValue>,
 ) {
@@ -41,7 +41,7 @@ pub(super) fn merge_locals(
 /// should NOT be stored in `locals_state` so that `local.get` falls
 /// back to `Local(id)`, enabling `decompose_address` to track memory
 /// stores/loads through frame pointers.
-pub(super) fn contains_unknown(sv: &StackValue) -> bool {
+pub fn contains_unknown(sv: &StackValue) -> bool {
     match sv {
         StackValue::Unknown => true,
         StackValue::BinOp { left, right, .. } => {
@@ -59,7 +59,7 @@ pub(super) fn contains_unknown(sv: &StackValue) -> bool {
 /// Recursively handles nested Add/Sub chains like `(Local(id) + 16) + (0 + 8)`.
 /// The WASM compiler often generates multi-level address arithmetic for
 /// stack-allocated arrays used by vec_new_from_linear_memory.
-pub(super) fn decompose_address(
+pub fn decompose_address(
     addr: &StackValue,
 ) -> Option<(LocalId, i64)> {
     match addr {
@@ -132,7 +132,7 @@ fn eval_const_i64(sv: &StackValue) -> Option<i64> {
 /// simulation doesn't fully execute loops, the copy may be incomplete. When
 /// the direct read has missing elements, we fall back to reading consecutive
 /// entries starting at offset 0 from the same local — the spill area.
-pub(super) fn try_decode_vec_elements(
+pub fn try_decode_vec_elements(
     args: &[StackValue],
     memory_state: &HashMap<(LocalId, i64), StackValue>,
 ) -> Option<Vec<StackValue>> {
@@ -197,7 +197,7 @@ pub(super) fn try_decode_vec_elements(
 ///
 /// Reads keys from the WASM data section (they're symbol Vals embedded in the binary),
 /// and reads values from the memory_state (stack-allocated tagged Vals).
-pub(super) fn try_decode_map_elements(
+pub fn try_decode_map_elements(
     args: &[StackValue],
     memory_state: &HashMap<(LocalId, i64), StackValue>,
     analyzed: &AnalyzedModule,
@@ -233,7 +233,7 @@ pub(super) fn try_decode_map_elements(
 }
 
 /// Map a walrus BinaryOp to our IR BinOp, returning None for unmappable ops.
-pub(super) fn map_binop(op: &BinaryOp) -> Option<crate::ir::BinOp> {
+pub fn map_binop(op: &BinaryOp) -> Option<crate::ir::BinOp> {
     use crate::ir::BinOp as B;
     use BinaryOp::*;
     match op {
@@ -273,7 +273,7 @@ pub(super) fn map_binop(op: &BinaryOp) -> Option<crate::ir::BinOp> {
 ///
 /// Most WASM unary ops are type conversions (wrap, extend, trunc) which are
 /// handled specially in the caller rather than mapped here.
-pub(super) fn map_unop(op: &UnaryOp) -> Option<crate::ir::UnOp> {
+pub fn map_unop(op: &UnaryOp) -> Option<crate::ir::UnOp> {
     use crate::ir::UnOp as U;
     match op {
         UnaryOp::F32Neg | UnaryOp::F64Neg => Some(U::Neg),

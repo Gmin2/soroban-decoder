@@ -21,7 +21,7 @@ use super::val_decoding::{
 ///
 /// `crn` is the call-result-names map, which may be partially built
 /// during the first pass.
-pub(super) fn recognize_call(
+pub fn recognize_call(
     call: &TrackedHostCall,
     ctx: &RecognitionContext,
     crn: &HashMap<usize, String>,

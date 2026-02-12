@@ -12,7 +12,7 @@ use crate::ir::{Expr, MethodCall, Statement};
 /// When `let sym_1 = Symbol::new(&env, "Counter")` duplicates an earlier
 /// `let sym = Symbol::new(&env, "Counter")`, remove `sym_1` and rewrite
 /// all references to `sym_1` as `sym`.
-pub(super) fn eliminate_common_subexprs(stmts: Vec<Statement>) -> Vec<Statement> {
+pub fn eliminate_common_subexprs(stmts: Vec<Statement>) -> Vec<Statement> {
     // Map from expression (via PartialEq) to the first binding name.
     let mut seen: Vec<(Expr, String)> = Vec::new();
     // Map from duplicate name → original name.
@@ -144,7 +144,7 @@ fn rename_expr_vars(expr: &Expr, renames: &HashMap<String, String>) -> Expr {
 /// remaining statements (including nested if/else/loop bodies) or the return.
 /// Side-effectful statements (Expr, Assign, Return, method calls in Let values)
 /// are always kept.
-pub(super) fn eliminate_dead_vars(stmts: Vec<Statement>) -> Vec<Statement> {
+pub fn eliminate_dead_vars(stmts: Vec<Statement>) -> Vec<Statement> {
     // Collect all variable names referenced across ALL statements.
     let mut referenced = std::collections::HashSet::new();
     for stmt in &stmts {

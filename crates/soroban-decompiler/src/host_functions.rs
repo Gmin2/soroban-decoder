@@ -1,22 +1,51 @@
+//! Soroban host function database.
+//!
+//! Soroban contracts interact with the runtime through host function imports.
+//! Each host function has a raw WASM-level export name (e.g. `"l"`, `"_"`)
+//! and a semantic name (e.g. `"get_contract_data"`, `"require_auth"`). This
+//! module loads the complete mapping from the bundled `env.json` file, which
+//! is sourced from the
+//! [`rs-soroban-env`](https://github.com/nickliao6/soroban-env-host) crate.
+//!
+//! The database is initialized lazily on first access and lives for the
+//! lifetime of the process. All string data is leaked to `&'static str` so
+//! that [`HostFunction`] references can be shared freely without lifetime
+//! concerns.
+
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use serde::Deserialize;
 
+/// A resolved Soroban host function with its full metadata.
+///
+/// Each instance describes one function exported by the Soroban host
+/// environment, including its semantic name, argument types, return type,
+/// and documentation string from the upstream specification.
 #[derive(Debug, Clone)]
 pub struct HostFunction {
+    /// Semantic module name (e.g. `"ledger"`, `"context"`, `"crypto"`).
     pub module: &'static str,
+    /// Raw WASM module export string used in the import table.
     pub module_export: &'static str,
+    /// Semantic function name (e.g. `"get_contract_data"`, `"require_auth"`).
     pub name: &'static str,
+    /// Raw WASM function export string used in the import table.
     pub fn_export: &'static str,
+    /// Typed argument list.
     pub args: Vec<HostFunctionArg>,
+    /// Return type name (e.g. `"Val"`, `"Void"`, `"U32Val"`).
     pub return_type: &'static str,
+    /// Documentation string from the upstream Soroban environment spec.
     pub docs: &'static str,
 }
 
+/// A single argument in a [`HostFunction`] signature.
 #[derive(Debug, Clone)]
 pub struct HostFunctionArg {
+    /// Argument name (e.g. `"key"`, `"val"`, `"storage_type"`).
     pub name: &'static str,
+    /// Argument type (e.g. `"Val"`, `"U32Val"`, `"StorageType"`).
     pub r#type: &'static str,
 }
 
@@ -92,6 +121,10 @@ static HOST_FUNCTIONS: LazyLock<HashMap<(String, String), HostFunction>> =
     });
 
 /// Resolve a WASM import to its semantic host function.
+///
+/// Looks up the `(module_export, fn_export)` pair in the lazily-initialized
+/// database. Returns the matched [`HostFunction`] with full metadata, or
+/// `None` if the import is not a recognized Soroban host function.
 pub fn lookup(module_export: &str, fn_export: &str) -> Option<&'static HostFunction> {
     HOST_FUNCTIONS.get(&(module_export.to_string(), fn_export.to_string()))
 }

@@ -186,7 +186,7 @@ pub fn strip_val_boilerplate(val: &StackValue) -> StackValue {
 ///
 /// Also handles the inline small-value encoding pattern:
 /// `(value << 8) | tag` which appears as BinOp(BitOr, BinOp(Shl, val, 8), tag).
-pub(super) fn unwrap_val_encoding(
+pub fn unwrap_val_encoding(
     ret: &StackValue,
     host_calls: &[TrackedHostCall],
 ) -> Option<StackValue> {
@@ -403,7 +403,7 @@ fn try_decode_val(val: i64) -> Option<Expr> {
 /// Resolve a stack value to an IR expression, using spec param names where possible.
 ///
 /// Strips Val encoding/decoding boilerplate first, then resolves to Expr.
-pub(super) fn resolve_arg(
+pub fn resolve_arg(
     val: &StackValue,
     param_names: &[String],
     call_result_names: &HashMap<usize, String>,
@@ -476,7 +476,7 @@ fn resolve_arg_inner(
 /// Wrap an expression in a reference (`&expr`) for contexts that need borrows.
 ///
 /// Skips wrapping for `env` and already-referenced variables.
-pub(super) fn as_ref(expr: Expr) -> Expr {
+pub fn as_ref(expr: Expr) -> Expr {
     match &expr {
         Expr::Var(name) if name == "env" => expr,
         Expr::Var(name) if name.starts_with('&') => expr,
