@@ -11,6 +11,10 @@ readme = "README.md"
 keywords = ["soroban", "stellar", "wasm", "decompiler", "smart-contracts"]
 categories = ["development-tools", "wasm"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 soroban-spec = { workspace = true }
 soroban-spec-rust = { workspace = true }

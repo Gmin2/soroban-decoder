@@ -11,6 +11,10 @@ readme = "README.md"
 keywords = ["soroban", "stellar", "wasm", "decompiler", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [[bin]]
 name = "soroban-decompile"
 path = "src/main.rs"
