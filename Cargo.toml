@@ -9,10 +9,13 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/Gmin2/soroban-decoder"
+homepage = "https://github.com/Gmin2/soroban-decoder"
+authors = ["Mintu Gogoi <mintugogoi567@gmail.com>"]
 
 [workspace.dependencies]
 # Internal workspace crate (so CLI can use the library)
-soroban-decompiler = { path = "crates/soroban-decompiler" }
+soroban-decompiler = { path = "crates/soroban-decompiler", version = "0.1.0" }
 
 # Soroban ecosystem (published versions from crates.io)
 soroban-spec = "25.1.0"

@@ -4,6 +4,12 @@ description = "Soroban WASM smart contract decompiler - reconstructs Rust source
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["soroban", "stellar", "wasm", "decompiler", "smart-contracts"]
+categories = ["development-tools", "wasm"]
 
 [dependencies]
 soroban-spec = { workspace = true }

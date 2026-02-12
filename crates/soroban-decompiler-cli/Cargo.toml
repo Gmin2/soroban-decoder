@@ -4,6 +4,12 @@ description = "CLI for decompiling Soroban WASM smart contracts back to Rust sou
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["soroban", "stellar", "wasm", "decompiler", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "soroban-decompile"
