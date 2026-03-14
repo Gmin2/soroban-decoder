@@ -780,12 +780,19 @@ fn scan_loop_body_nested(
 fn is_user_comparison(expr: &Expr) -> bool {
     use crate::ir::BinOp as B;
     match expr {
+        // Direct comparison: amount <= 0, val < share_amount, len > 10
         Expr::BinOp { op: B::Lt | B::Le | B::Gt | B::Ge | B::Eq | B::Ne, left, right } => {
-            has_named_var(left) && has_named_var(right)
+            (has_named_var(left) || has_named_var(right))
                 && !is_type_tag_check_expr(expr)
                 && !is_overflow_check_expr(expr)
                 && !is_arithmetic_overflow_check(expr)
         }
+        // Method call result used as bool guard: claimants.is_empty()
+        Expr::MethodChain { .. } if has_named_var(expr) => true,
+        // Host call / helper result used as bool guard: is_initialized()
+        Expr::HostCall { .. } => true,
+        // Negated expression: !check_time_bound(...)
+        Expr::UnOp { op: crate::ir::UnOp::Not, operand } => is_user_comparison(operand),
         _ => false,
     }
 }
