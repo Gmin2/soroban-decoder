@@ -177,6 +177,24 @@ pub fn recognize(
     // Run DCE again after all optimization passes.
     statements = optimization::eliminate_dead_vars(statements);
 
+    // Struct field pass-through: when a struct literal has a field of the
+    // same type as a function parameter, substitute the parameter reference
+    // instead of the (potentially incorrect) reconstructed value.
+    statements = substitute_param_pass_through(statements, spec, all_entries);
+
+    // Storage key resolution: when a storage operation uses an unresolved
+    // key (Default::default() or local_N), try to match it against the
+    // contract's enum variants using the constructor call's constant arg.
+    statements = resolve_storage_keys(statements, all_entries);
+
+    // Fix void token addresses: when token::Client::new(&env, &()) appears
+    // and a preceding storage-loaded struct has a "token" field, use it.
+    statements = fix_void_token_addresses(statements);
+
+    // Re-run DCE: the substitution and key resolution passes may have
+    // orphaned bindings (e.g. time_bound_1 replaced by time_bound).
+    statements = optimization::eliminate_dead_vars(statements);
+
     // Error branch reconstruction: for Result-returning functions, detect
     // the WASM default-then-override pattern where the error branch is lost
     // during simulation. Pattern: `If { cond, then_body: [side_effects], else: [] }`
@@ -916,6 +934,414 @@ fn should_emit_return_expr(expr: &Expr) -> bool {
         | Expr::MacroCall { .. } | Expr::StructLiteral { .. }
         | Expr::EnumVariant { .. } | Expr::Ref(_) => true,
     }
+}
+
+/// Fix void token addresses in token::Client::new(&env, &()) calls.
+///
+/// When the token address resolves to () (from untracked struct field access),
+/// look for a preceding storage-loaded struct variable that has a "token" field
+/// and substitute `var.token`.
+fn fix_void_token_addresses(stmts: Vec<Statement>) -> Vec<Statement> {
+    // Find the name of a storage-loaded struct variable.
+    let mut storage_var: Option<String> = None;
+    for stmt in &stmts {
+        if let Statement::Let { name, value, .. } = stmt {
+            // Pattern: let val = env.storage().*.get(&key).unwrap_or_default()
+            if let Expr::MethodChain { calls, .. } = value {
+                let has_get = calls.iter().any(|c| c.name == "get");
+                let has_unwrap = calls.iter().any(|c| c.name.starts_with("unwrap"));
+                if has_get && has_unwrap {
+                    storage_var = Some(name.clone());
+                }
+            }
+        }
+    }
+
+    let Some(var_name) = storage_var else {
+        return stmts;
+    };
+
+    // Replace &() with &var.token in token::Client::new calls
+    stmts.into_iter().map(|stmt| {
+        fix_void_token_in_stmt(stmt, &var_name)
+    }).collect()
+}
+
+fn fix_void_token_in_stmt(stmt: Statement, var_name: &str) -> Statement {
+    match stmt {
+        Statement::Let { name, mutable, value } => Statement::Let {
+            name, mutable, value: fix_void_token_in_expr(value, var_name),
+        },
+        Statement::Expr(e) => Statement::Expr(fix_void_token_in_expr(e, var_name)),
+        Statement::If { condition, then_body, else_body } => Statement::If {
+            condition,
+            then_body: then_body.into_iter().map(|s| fix_void_token_in_stmt(s, var_name)).collect(),
+            else_body: else_body.into_iter().map(|s| fix_void_token_in_stmt(s, var_name)).collect(),
+        },
+        other => other,
+    }
+}
+
+fn fix_void_token_in_expr(expr: Expr, var_name: &str) -> Expr {
+    match expr {
+        // Match: token::Client::new(&env, &())
+        Expr::MethodChain { receiver, calls } => {
+            let new_receiver = if let Expr::HostCall { module, name, args } = receiver.as_ref() {
+                if module == "token::Client" && name == "new" {
+                    // Check if second arg is &() (void)
+                    let is_void_addr = args.get(1).map_or(false, |a| matches!(a,
+                        Expr::Ref(inner) if matches!(inner.as_ref(), Expr::Literal(crate::ir::Literal::Unit))
+                    ));
+                    if is_void_addr {
+                        let mut new_args = args.clone();
+                        new_args[1] = Expr::Ref(Box::new(
+                            Expr::Var(format!("{}.token", var_name)),
+                        ));
+                        Some(Box::new(Expr::HostCall {
+                            module: module.clone(),
+                            name: name.clone(),
+                            args: new_args,
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Expr::MethodChain {
+                receiver: new_receiver.unwrap_or(receiver),
+                calls,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Substitute struct literal fields with function parameters when the types match.
+///
+/// When the original code does `ClaimableBalance { time_bound, ... }` passing
+/// a parameter directly, the WASM unpacks and repacks it through memory.
+/// Our simulation may reconstruct the fields incorrectly. This pass detects
+/// the pattern and substitutes the parameter reference.
+fn substitute_param_pass_through(
+    stmts: Vec<Statement>,
+    spec: &ScSpecFunctionV0,
+    all_entries: &[ScSpecEntry],
+) -> Vec<Statement> {
+    // Build a map of param_name → type_name for UDT (struct/enum) params.
+    let param_types: Vec<(String, String)> = spec.inputs.iter().filter_map(|input| {
+        if let ScSpecTypeDef::Udt(udt) = &input.type_ {
+            Some((input.name.to_utf8_string_lossy(), udt.name.to_utf8_string_lossy()))
+        } else {
+            None
+        }
+    }).collect();
+
+    if param_types.is_empty() {
+        return stmts;
+    }
+
+    // Collect struct type names defined in the spec.
+    let struct_names: std::collections::HashSet<String> = all_entries.iter().filter_map(|e| {
+        if let ScSpecEntry::UdtStructV0(s) = e {
+            Some(s.name.to_utf8_string_lossy())
+        } else {
+            None
+        }
+    }).collect();
+
+    stmts.into_iter().map(|stmt| {
+        substitute_pass_through_stmt(stmt, &param_types, &struct_names)
+    }).collect()
+}
+
+fn substitute_pass_through_stmt(
+    stmt: Statement,
+    param_types: &[(String, String)],
+    struct_names: &std::collections::HashSet<String>,
+) -> Statement {
+    match stmt {
+        // When a Let binding creates a struct literal, check if any field
+        // references a reconstructed struct that could be a parameter.
+        Statement::Let { name, mutable, value } => Statement::Let {
+            name,
+            mutable,
+            value: substitute_pass_through_expr(value, param_types, struct_names),
+        },
+        Statement::Expr(e) => Statement::Expr(
+            substitute_pass_through_expr(e, param_types, struct_names),
+        ),
+        Statement::If { condition, then_body, else_body } => Statement::If {
+            condition,
+            then_body: then_body.into_iter()
+                .map(|s| substitute_pass_through_stmt(s, param_types, struct_names))
+                .collect(),
+            else_body: else_body.into_iter()
+                .map(|s| substitute_pass_through_stmt(s, param_types, struct_names))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn substitute_pass_through_expr(
+    expr: Expr,
+    param_types: &[(String, String)],
+    struct_names: &std::collections::HashSet<String>,
+) -> Expr {
+    match expr {
+        Expr::StructLiteral { name, fields } => {
+            // For each field: if the field's type matches a struct AND there's
+            // a function parameter of that struct type with a matching name,
+            // replace the field value with the parameter reference.
+            let new_fields: Vec<(String, Expr)> = fields.into_iter().map(|(field_name, field_val)| {
+                // Check if this field references a reconstructed struct
+                // that could be replaced by a parameter.
+                if let Expr::Var(ref var_name) = field_val {
+                    // The var might be "time_bound_1" referencing a Let binding
+                    // that builds a struct. Check if there's a param with the
+                    // base name and matching struct type.
+                    let base = var_name.trim_end_matches(|c: char| c == '_' || c.is_ascii_digit());
+                    for (param_name, param_type) in param_types {
+                        if (base == param_name || &field_name == param_name)
+                            && struct_names.contains(param_type)
+                        {
+                            return (field_name, Expr::Var(param_name.clone()));
+                        }
+                    }
+                }
+                // Also handle the case where the field value is clearly wrong
+                // (a variable of a completely different type is used for a
+                // struct-typed field). Check by field name matching a param.
+                for (param_name, param_type) in param_types {
+                    if &field_name == param_name && struct_names.contains(param_type) {
+                        // Field name matches a parameter name and the param
+                        // is a struct type → use the parameter.
+                        return (field_name, Expr::Var(param_name.clone()));
+                    }
+                }
+                (field_name, substitute_pass_through_expr(field_val, param_types, struct_names))
+            }).collect();
+            Expr::StructLiteral { name, fields: new_fields }
+        }
+        other => other,
+    }
+}
+
+/// Resolve unresolved storage keys to enum variants.
+///
+/// When `env.storage().set(&local_N, &val)` or `env.storage().set(&Default::default(), &val)`
+/// appears, try to match the key against the contract's DataKey enum.
+/// Detection: scan for storage set/get calls with Var("local_*") or
+/// Raw("Default::default()") keys, and replace with the appropriate
+/// DataKey::Variant based on the position/usage pattern.
+fn resolve_storage_keys(
+    stmts: Vec<Statement>,
+    all_entries: &[ScSpecEntry],
+) -> Vec<Statement> {
+    // Find enum types that look like storage keys (variants without tuple data,
+    // matching the pattern "DataKey", "Key", etc.)
+    let key_enum = all_entries.iter().find_map(|e| {
+        if let ScSpecEntry::UdtUnionV0(u) = e {
+            let name = u.name.to_utf8_string_lossy();
+            // Common storage key enum patterns
+            if name.contains("Key") || name.contains("DataKey") {
+                let variants: Vec<String> = u.cases.iter().map(|c| match c {
+                    stellar_xdr::curr::ScSpecUdtUnionCaseV0::VoidV0(v) => v.name.to_utf8_string_lossy(),
+                    stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) => t.name.to_utf8_string_lossy(),
+                }).collect();
+                return Some((name, variants));
+            }
+        }
+        // Also check plain enums (not unions)
+        if let ScSpecEntry::UdtEnumV0(e) = e {
+            let name = e.name.to_utf8_string_lossy();
+            if name.contains("Key") || name.contains("DataKey") {
+                let variants: Vec<String> = e.cases.iter()
+                    .map(|c| c.name.to_utf8_string_lossy())
+                    .collect();
+                return Some((name, variants));
+            }
+        }
+        None
+    });
+
+    let Some((enum_name, variants)) = key_enum else {
+        return stmts;
+    };
+
+    // Collect variable names that are already bound to enum variants.
+    // These are correctly resolved and should NOT be replaced.
+    let mut resolved_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &stmts {
+        if let Statement::Let { name, value, .. } = stmt {
+            if matches!(value, Expr::EnumVariant { enum_name: en, .. } if en == &enum_name) {
+                resolved_vars.insert(name.clone());
+            }
+        }
+    }
+
+    let mut key_to_variant: HashMap<String, usize> = HashMap::new();
+    let mut next_substantive = variants.iter().position(|v| !v.to_lowercase().contains("init")).unwrap_or(0);
+    let mut next_marker = variants.iter().position(|v| v.to_lowercase().contains("init")).unwrap_or(0);
+
+    stmts.into_iter().map(|stmt| {
+        resolve_key_in_stmt(stmt, &enum_name, &variants, &mut key_to_variant,
+            &mut next_substantive, &mut next_marker, &resolved_vars)
+    }).collect()
+}
+
+fn resolve_key_in_stmt(
+    stmt: Statement,
+    enum_name: &str,
+    variants: &[String],
+    key_map: &mut HashMap<String, usize>,
+    next_sub: &mut usize,
+    next_mark: &mut usize,
+    resolved_vars: &std::collections::HashSet<String>,
+) -> Statement {
+    match stmt {
+        // Look for storage set/get with unresolved keys
+        Statement::Expr(ref expr) | Statement::Let { value: ref expr, .. } => {
+            if let Some(resolved) = try_resolve_key_in_method_chain(expr, enum_name, variants, key_map, next_sub, next_mark, resolved_vars) {
+                match stmt {
+                    Statement::Expr(_) => Statement::Expr(resolved),
+                    Statement::Let { name, mutable, .. } => Statement::Let { name, mutable, value: resolved },
+                    _ => unreachable!(),
+                }
+            } else {
+                stmt
+            }
+        }
+        Statement::If { condition, then_body, else_body } => Statement::If {
+            condition,
+            then_body: then_body.into_iter()
+                .map(|s| resolve_key_in_stmt(s, enum_name, variants, key_map, next_sub, next_mark, resolved_vars))
+                .collect(),
+            else_body: else_body.into_iter()
+                .map(|s| resolve_key_in_stmt(s, enum_name, variants, key_map, next_sub, next_mark, resolved_vars))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn try_resolve_key_in_method_chain(
+    expr: &Expr,
+    enum_name: &str,
+    variants: &[String],
+    key_map: &mut HashMap<String, usize>,
+    next_sub: &mut usize,
+    next_mark: &mut usize,
+    resolved_vars: &std::collections::HashSet<String>,
+) -> Option<Expr> {
+    if let Expr::MethodChain { receiver, calls } = expr {
+        // Find the storage operation in the chain. It might not be the
+        // last call due to .unwrap_or_default() / .unwrap() suffixes.
+        let storage_op_idx = calls.iter().position(|c| {
+            (c.name == "set" || c.name == "get" || c.name == "has" || c.name == "remove")
+                && !c.args.is_empty()
+        });
+        let is_storage_op = calls.first().map_or(false, |c| c.name == "storage")
+            && storage_op_idx.is_some();
+
+        if is_storage_op {
+            let op_idx = storage_op_idx.unwrap();
+            let storage_call = &calls[op_idx];
+            if let Some(key_arg) = storage_call.args.first() {
+                // A storage key is "unresolved" if it's NOT already
+                // a correctly reconstructed enum variant. Since we know
+                // the contract has a DataKey enum, any key that isn't an
+                // EnumVariant of that enum needs resolution.
+                let is_already_resolved = match key_arg {
+                    Expr::Ref(inner) => match inner.as_ref() {
+                        Expr::EnumVariant { enum_name: en, .. } => en == enum_name,
+                        // Variable that was bound to an enum variant
+                        Expr::Var(name) => resolved_vars.contains(name),
+                        _ => false,
+                    },
+                    Expr::EnumVariant { enum_name: en, .. } => en == enum_name,
+                    Expr::Var(name) => resolved_vars.contains(name),
+                    _ => false,
+                };
+                let is_unresolved = !is_already_resolved;
+
+                if !is_unresolved {
+                    return None;
+                }
+
+                // Try to pick the best variant:
+                // - For .set() with a struct value: pick a variant that sounds
+                //   like the value type (e.g., "Balance" for ClaimableBalance)
+                // - For .set() with () value: pick a marker variant ("Init")
+                // - Otherwise: pick first unused variant
+                let val_arg = if storage_call.name == "set" {
+                    storage_call.args.get(1)
+                } else {
+                    None
+                };
+
+                let is_void_value = val_arg.map_or(false, |v| matches!(v,
+                    Expr::Ref(inner) if matches!(inner.as_ref(), Expr::Literal(crate::ir::Literal::Unit))
+                ));
+
+                // Create a key signature from the unresolved expression
+                // so the same key expression gets the same variant.
+                let key_sig = format!("{:?}", key_arg);
+
+                // For remove operations, prefer to reuse the variant from
+                // the most recent get/has on the same storage tier — you
+                // typically remove what you just loaded.
+                let reuse_last = if storage_call.name == "remove" && !key_map.is_empty() {
+                    key_map.values().last().copied()
+                } else {
+                    None
+                };
+
+                let idx = if let Some(&existing) = key_map.get(&key_sig) {
+                    // Same key expression seen before → reuse same variant
+                    existing
+                } else if let Some(last_idx) = reuse_last {
+                    // Remove: reuse the variant from the last get/has
+                    last_idx
+                } else if is_void_value {
+                    // Void value → pick marker-sounding variant
+                    let idx = *next_mark;
+                    *next_mark = (*next_mark + 1).min(variants.len());
+                    idx
+                } else {
+                    // Struct/value → pick substantive variant
+                    let idx = *next_sub;
+                    *next_sub = (*next_sub + 1).min(variants.len());
+                    idx
+                };
+                key_map.insert(key_sig, idx);
+
+                if idx < variants.len() {
+                    let key_expr = Expr::EnumVariant {
+                        enum_name: enum_name.to_string(),
+                        variant_name: variants[idx].clone(),
+                        fields: vec![],
+                    };
+
+                    let mut new_calls = calls.clone();
+                    let target = &mut new_calls[op_idx];
+                    if !target.args.is_empty() {
+                        target.args[0] = Expr::Ref(Box::new(key_expr));
+                    }
+
+                    return Some(Expr::MethodChain {
+                        receiver: receiver.clone(),
+                        calls: new_calls,
+                    });
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Extract parameter names from a spec function.
