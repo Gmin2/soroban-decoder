@@ -70,15 +70,13 @@ Given the `hello_world` contract, the decompiler produces:
 ```rust
 #![no_std]
 use soroban_sdk::{contract, contractimpl, Env, String, Vec};
-
 #[contract]
-pub struct HelloWorldContract;
-
+pub struct Contract;
 #[contractimpl]
-impl HelloWorldContract {
+impl Contract {
     pub fn hello(env: Env, to: String) -> Vec<String> {
         let str_val = String::from_str(&env, "Hello");
-        let args = vec!(&env, str_val, to);
+        let args = vec![&env, str_val, to];
         return args;
     }
 }

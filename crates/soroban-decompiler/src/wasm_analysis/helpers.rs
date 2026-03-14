@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use walrus::ir::{self, BinaryOp, UnaryOp};
 use walrus::LocalId;
 
-use super::{AnalyzedModule, StackValue};
+use super::{AnalyzedModule, MemBase, StackValue};
 
 /// Merge locals from two branches after an if/else.
 ///
@@ -50,6 +50,8 @@ pub fn contains_unknown(sv: &StackValue) -> bool {
         StackValue::UnOp { operand, .. } => {
             contains_unknown(operand)
         }
+        // Global (shadow stack pointer) is trackable, not unknown.
+        StackValue::Global(_) => false,
         _ => false,
     }
 }
@@ -61,24 +63,25 @@ pub fn contains_unknown(sv: &StackValue) -> bool {
 /// stack-allocated arrays used by vec_new_from_linear_memory.
 pub fn decompose_address(
     addr: &StackValue,
-) -> Option<(LocalId, i64)> {
+) -> Option<(MemBase, i64)> {
     match addr {
-        StackValue::Local(lid) => Some((*lid, 0)),
+        StackValue::Local(lid) => Some((MemBase::Local(*lid), 0)),
+        StackValue::Global(gid) => Some((MemBase::Global(*gid), 0)),
         StackValue::BinOp {
             op: crate::ir::BinOp::Add,
             left,
             right,
         } => {
             // Try left as base, right as constant offset.
-            if let Some((lid, base)) = decompose_address(left) {
+            if let Some((base_id, base)) = decompose_address(left) {
                 if let Some(rv) = eval_const_i64(right) {
-                    return Some((lid, base + rv));
+                    return Some((base_id, base + rv));
                 }
             }
             // Try right as base, left as constant offset.
-            if let Some((lid, base)) = decompose_address(right) {
+            if let Some((base_id, base)) = decompose_address(right) {
                 if let Some(lv) = eval_const_i64(left) {
-                    return Some((lid, base + lv));
+                    return Some((base_id, base + lv));
                 }
             }
             None
@@ -88,9 +91,9 @@ pub fn decompose_address(
             left,
             right,
         } => {
-            if let Some((lid, base)) = decompose_address(left) {
+            if let Some((base_id, base)) = decompose_address(left) {
                 if let Some(rv) = eval_const_i64(right) {
-                    return Some((lid, base - rv));
+                    return Some((base_id, base - rv));
                 }
             }
             None
@@ -134,14 +137,14 @@ fn eval_const_i64(sv: &StackValue) -> Option<i64> {
 /// entries starting at offset 0 from the same local — the spill area.
 pub fn try_decode_vec_elements(
     args: &[StackValue],
-    memory_state: &HashMap<(LocalId, i64), StackValue>,
+    memory_state: &HashMap<(MemBase, i64), StackValue>,
 ) -> Option<Vec<StackValue>> {
     let ptr_raw = args.get(0)?;
     let len_raw = args.get(1)?;
 
     // Strip Val encoding from ptr: (expr << 32) | 4 → expr
     let ptr_stripped = crate::pattern_recognizer::strip_val_boilerplate(ptr_raw);
-    let (base_local, base_offset) = decompose_address(&ptr_stripped)?;
+    let (base_mem, base_offset) = decompose_address(&ptr_stripped)?;
 
     // Extract len as u32
     let len = crate::pattern_recognizer::extract_u32_val(len_raw)?;
@@ -152,7 +155,7 @@ pub fn try_decode_vec_elements(
     let mut all_found = true;
     for i in 0..len {
         let offset = base_offset + (i as i64) * 8;
-        if let Some(val) = memory_state.get(&(base_local, offset)) {
+        if let Some(val) = memory_state.get(&(base_mem, offset)) {
             elements.push(val.clone());
         } else {
             all_found = false;
@@ -167,13 +170,13 @@ pub fn try_decode_vec_elements(
     // Fallback: try reading from common spill area offsets.
     // The compiler stores values at $frame+N, $frame+N+8, ... then copies them
     // to the vec array via a loop that our single-pass simulation doesn't fully run.
-    for spill_base in &[0i64, 8, 16, 24, 32, 48] {
+    for spill_base in &[0i64, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 96, 112, 128] {
         if *spill_base == base_offset { continue; }
         let mut spill_elements = Vec::new();
         let mut spill_ok = true;
         for i in 0..len {
             let offset = *spill_base + (i as i64) * 8;
-            if let Some(val) = memory_state.get(&(base_local, offset)) {
+            if let Some(val) = memory_state.get(&(base_mem, offset)) {
                 spill_elements.push(val.clone());
             } else {
                 spill_ok = false;
@@ -182,6 +185,32 @@ pub fn try_decode_vec_elements(
         }
         if spill_ok && !spill_elements.iter().all(|v| matches!(v, StackValue::Unknown)) {
             return Some(spill_elements);
+        }
+    }
+
+    // Broader fallback: scan ALL known memory locations for the base_mem
+    // and try to find a consecutive run of `len` entries at 8-byte stride.
+    let mut known_offsets: Vec<i64> = memory_state.keys()
+        .filter(|(lid, _)| *lid == base_mem)
+        .map(|(_, off)| *off)
+        .collect();
+    known_offsets.sort();
+    known_offsets.dedup();
+    for &start in &known_offsets {
+        if start == base_offset { continue; }
+        let mut scan_elements = Vec::new();
+        let mut scan_ok = true;
+        for i in 0..len {
+            let offset = start + (i as i64) * 8;
+            if let Some(val) = memory_state.get(&(base_mem, offset)) {
+                scan_elements.push(val.clone());
+            } else {
+                scan_ok = false;
+                break;
+            }
+        }
+        if scan_ok && !scan_elements.iter().all(|v| matches!(v, StackValue::Unknown)) {
+            return Some(scan_elements);
         }
     }
 
@@ -199,7 +228,7 @@ pub fn try_decode_vec_elements(
 /// and reads values from the memory_state (stack-allocated tagged Vals).
 pub fn try_decode_map_elements(
     args: &[StackValue],
-    memory_state: &HashMap<(LocalId, i64), StackValue>,
+    memory_state: &HashMap<(MemBase, i64), StackValue>,
     analyzed: &AnalyzedModule,
 ) -> Option<(Vec<String>, Vec<StackValue>)> {
     let keys_ptr_raw = args.get(0)?;
@@ -216,10 +245,10 @@ pub fn try_decode_map_elements(
     // Values: read from memory_state at the vals_ptr location.
     let vals_stripped = crate::pattern_recognizer::strip_val_boilerplate(vals_ptr_raw);
     let mut values = Vec::new();
-    if let Some((base_local, base_offset)) = decompose_address(&vals_stripped) {
+    if let Some((base_mem, base_offset)) = decompose_address(&vals_stripped) {
         for i in 0..len {
             let offset = base_offset + (i as i64) * 8;
-            let val = memory_state.get(&(base_local, offset))
+            let val = memory_state.get(&(base_mem, offset))
                 .cloned()
                 .unwrap_or(StackValue::Unknown);
             values.push(val);

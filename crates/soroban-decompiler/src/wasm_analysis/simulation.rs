@@ -9,7 +9,7 @@ use walrus::{FunctionId, FunctionKind, LocalFunction, LocalId, Module};
 use walrus::ir::{self, BinaryOp, Instr, InstrSeqId, InstrSeqType, UnaryOp};
 
 use crate::host_functions::HostFunction;
-use super::{AnalyzedModule, AnalyzedBlock, FunctionStackAnalysis, StackValue, TrackedHostCall};
+use super::{AnalyzedModule, AnalyzedBlock, FunctionStackAnalysis, MemBase, StackValue, TrackedHostCall};
 use super::helpers::{
     contains_unknown, decompose_address, merge_locals,
     try_decode_vec_elements, try_decode_map_elements, map_binop, map_unop,
@@ -24,11 +24,14 @@ struct SimulationState {
     tracked: Vec<TrackedHostCall>,
     blocks: Vec<AnalyzedBlock>,
     locals_state: HashMap<LocalId, StackValue>,
-    memory_state: HashMap<(LocalId, i64), StackValue>,
+    memory_state: HashMap<(MemBase, i64), StackValue>,
     vec_contents: HashMap<usize, Vec<StackValue>>,
     map_contents: HashMap<usize, (Vec<String>, Vec<StackValue>)>,
     unpack_field_ids: HashMap<usize, Vec<usize>>,
     next_call_id: usize,
+    /// Captured return value when `Return` instruction is hit inside a
+    /// nested block. This prevents the Block drain from discarding it.
+    return_value: Option<StackValue>,
 }
 
 impl SimulationState {
@@ -44,6 +47,7 @@ impl SimulationState {
             map_contents: HashMap::new(),
             unpack_field_ids: HashMap::new(),
             next_call_id: 0,
+            return_value: None,
         }
     }
 
@@ -72,7 +76,10 @@ impl AnalyzedModule {
             func_id, &[], 0, &mut state,
         );
 
-        let return_expr = state.stack.pop();
+        // Prefer the explicitly captured return value (from `Return`
+        // instructions inside nested blocks) over whatever remains on
+        // the stack, since the Block drain may have removed it.
+        let return_expr = state.return_value.or_else(|| state.stack.pop());
         FunctionStackAnalysis {
             blocks: state.blocks,
             host_calls: state.tracked,
@@ -93,7 +100,7 @@ impl AnalyzedModule {
         depth: usize,
         state: &mut SimulationState,
     ) {
-        if depth > 5 {
+        if depth > 9 {
             return;
         }
 
@@ -122,15 +129,35 @@ impl AnalyzedModule {
     }
 
     /// Recursively simulate the stack for one instruction sequence.
+    ///
+    /// Returns `Some(target_seq_id)` if the sequence ended with a `Br`
+    /// targeting an ancestor block. The caller should propagate the
+    /// break upward until the matching block is reached, skipping
+    /// remaining instructions in intermediate blocks.
     fn simulate_seq(
         &self,
         func: &LocalFunction,
         seq_id: InstrSeqId,
         state: &mut SimulationState,
         depth: usize,
-    ) {
+    ) -> Option<InstrSeqId> {
         let seq = func.block(seq_id);
-        for (instr, _) in &seq.instrs {
+        self.simulate_instrs(func, &seq.instrs, state, depth)
+    }
+
+    /// Simulate a slice of instructions. Factored out of `simulate_seq`
+    /// so that `BrIf` handling can recurse on the remaining tail.
+    fn simulate_instrs(
+        &self,
+        func: &LocalFunction,
+        instrs: &[(Instr, ir::InstrLocId)],
+        state: &mut SimulationState,
+        depth: usize,
+    ) -> Option<InstrSeqId> {
+        let mut idx = 0;
+        while idx < instrs.len() {
+            let (instr, _) = &instrs[idx];
+            idx += 1;
             match instr {
                 Instr::Const(c) => {
                     state.stack.push(StackValue::Const(c.value));
@@ -164,8 +191,8 @@ impl AnalyzedModule {
                         }
                     }
                 }
-                Instr::GlobalGet(_) => {
-                    state.stack.push(StackValue::Unknown);
+                Instr::GlobalGet(gg) => {
+                    state.stack.push(StackValue::Global(gg.global));
                 }
                 Instr::GlobalSet(_) => {
                     state.stack.pop();
@@ -176,9 +203,35 @@ impl AnalyzedModule {
                     );
                 }
                 Instr::Block(b) => {
-                    self.simulate_seq(
+                    let pre_len = state.stack.len();
+                    let br_target = self.simulate_seq(
                         func, b.seq, state, depth,
                     );
+                    // Enforce the block's declared result type.
+                    let result_count = seq_result_count(
+                        &self.module, func.block(b.seq),
+                    );
+                    let expected = pre_len + result_count;
+                    if state.stack.len() > expected {
+                        // Before draining, capture the top-of-stack as a
+                        // potential return value. This handles functions
+                        // that leave a value on the stack without an
+                        // explicit Return instruction.
+                        if state.return_value.is_none() {
+                            state.return_value = state.stack.last().cloned();
+                        }
+                        let excess = state.stack.len() - expected;
+                        state.stack.drain(pre_len..pre_len + excess);
+                    }
+                    // If a `br` targeted this block, the break is consumed.
+                    // If it targeted an ancestor, propagate upward.
+                    if let Some(target) = br_target {
+                        if target != b.seq {
+                            return Some(target);
+                        }
+                        // Break targets this block — continue with
+                        // the instructions after the block normally.
+                    }
                 }
                 Instr::Loop(l) => {
                     self.simulate_loop(func, l, state, depth);
@@ -201,10 +254,10 @@ impl AnalyzedModule {
                     self.simulate_unop(&u.op, state);
                 }
                 Instr::Load(load) => {
-                    self.simulate_load(load, state);
+                    self.simulate_load(load, state, depth);
                 }
                 Instr::Store(store) => {
-                    self.simulate_store(store, state);
+                    self.simulate_store(store, state, depth);
                 }
                 Instr::MemorySize(_) => {
                     state.stack.push(StackValue::Unknown);
@@ -219,15 +272,133 @@ impl AnalyzedModule {
                     state.stack.pop();
                     state.stack.push(StackValue::Unknown);
                 }
-                Instr::Return(_)
-                | Instr::Unreachable(_)
-                | Instr::Br(_) => {}
-                Instr::BrIf(_) | Instr::BrTable(_) => {
-                    state.stack.pop();
+                Instr::Return(_) => {
+                    // Capture the return value before breaking so that
+                    // the Block drain cannot discard it.
+                    if state.return_value.is_none() {
+                        state.return_value = state.stack.last().cloned();
+                    }
+                    break;
+                }
+                Instr::Unreachable(_) => {
+                    break;
+                }
+                Instr::Br(br) => {
+                    // Signal the break target to the caller so that
+                    // intermediate blocks skip their remaining code.
+                    return Some(br.block);
+                }
+                Instr::BrIf(_br) => {
+                    let condition = state.stack.pop();
+                    let remaining = &instrs[idx..];
+
+                    // Check if the remaining instructions contain any
+                    // host calls or meaningful control flow. If so,
+                    // model the br_if as an AnalyzedBlock::If where
+                    // the else-block is the continuation (condition
+                    // false / branch not taken) and the then-block is
+                    // empty (condition true / branch taken = exit).
+                    if remaining_has_calls(remaining) {
+                        // Save the "taken" path state (condition true,
+                        // branch exits to target block).
+                        let taken_stack = state.stack.clone();
+                        let taken_locals = state.locals_state.clone();
+                        let taken_memory = state.memory_state.clone();
+
+                        // Simulate the continuation (branch NOT taken)
+                        // in the current state.
+                        let saved_blocks =
+                            std::mem::take(&mut state.blocks);
+                        let cont_br = self.simulate_instrs(
+                            func, remaining, state, depth,
+                        );
+                        let cont_blocks = std::mem::replace(
+                            &mut state.blocks,
+                            saved_blocks,
+                        );
+
+                        // Check if continuation ends in unreachable/br
+                        let cont_ends_unreachable =
+                            remaining_ends_unreachable(remaining);
+
+                        if !cont_blocks.is_empty() {
+                            // The condition in br_if means "if true,
+                            // branch away". The continuation runs when
+                            // condition is false. Emit:
+                            // `if cond { /*taken: exit block*/ }
+                            //  else { continuation }`
+                            state.blocks.push(AnalyzedBlock::If {
+                                condition,
+                                then_block: vec![],
+                                else_block: cont_blocks,
+                                alt_unreachable: cont_ends_unreachable,
+                            });
+                        }
+
+                        // After the enclosing block, both the "taken"
+                        // path and the continuation converge. Choose
+                        // the best state for subsequent instructions.
+                        if cont_ends_unreachable || cont_br.is_some() {
+                            // Continuation doesn't fall through — use
+                            // the taken path's state exclusively.
+                            state.stack = taken_stack;
+                            state.locals_state = taken_locals;
+                            state.memory_state = taken_memory;
+                        } else {
+                            // Both paths converge. Keep the
+                            // continuation's locals as-is rather than
+                            // merging, since the continuation is the
+                            // "body" of the conditional (the happy
+                            // path with storage ops, computations,
+                            // etc.) and provides more useful bindings
+                            // for downstream resolution. The "taken"
+                            // path merely exits the block early.
+                            state.memory_state.extend(taken_memory);
+                        }
+
+                        // All remaining instructions have been
+                        // consumed by the continuation simulation.
+                        // If the continuation ended with a br to an
+                        // outer block, propagate it so that enclosing
+                        // blocks skip their remaining code (e.g.
+                        // switch-case with br to merge point).
+                        if let Some(target) = cont_br {
+                            return Some(target);
+                        }
+                        break;
+                    }
+                    // No meaningful content after br_if — fall through
+                    // as before (just pop the condition).
+                }
+                Instr::BrTable(bt) => {
+                    let disc = state.stack.pop();
+                    // If the discriminant is a known constant, resolve
+                    // the branch target and propagate as a Br.
+                    // This enables correct enum variant selection when
+                    // the discriminant is passed as a constant arg.
+                    if let Some(idx) = disc.as_ref().and_then(|d| {
+                        match d {
+                            StackValue::Const(ir::Value::I32(n)) => {
+                                Some(*n as usize)
+                            }
+                            StackValue::Const(ir::Value::I64(n)) => {
+                                Some(*n as usize)
+                            }
+                            _ => None,
+                        }
+                    }) {
+                        let target = bt.blocks
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(bt.default);
+                        return Some(target);
+                    }
+                    // Unknown discriminant — fall through (no jump).
                 }
                 _ => {}
             }
         }
+        None
     }
 
     /// Simulate a function call instruction.
@@ -280,6 +451,12 @@ impl AnalyzedModule {
             if let Some(elems) = try_decode_vec_elements(
                 args, &state.memory_state,
             ) {
+                if std::env::var("DECOMPILER_DEBUG_VEC").is_ok() {
+                    eprintln!("[VEC id={}] {} elements:", id, elems.len());
+                    for (i, el) in elems.iter().enumerate() {
+                        eprintln!("  [{}] {:?}", i, el);
+                    }
+                }
                 state.vec_contents.insert(id, elems);
             }
         }
@@ -380,8 +557,11 @@ impl AnalyzedModule {
         state: &mut SimulationState,
     ) {
         // Build a child SimulationState for the callee.
+        // Inherit the parent's memory_state so the callee can read
+        // values that the caller stored to the linear memory frame.
         let mut child = SimulationState::new();
         child.next_call_id = state.next_call_id;
+        child.memory_state = state.memory_state.clone();
 
         self.analyze_function_stack_inner(
             callee_id, args, depth + 1, &mut child,
@@ -391,9 +571,9 @@ impl AnalyzedModule {
 
         let inner_has_host_calls = !child.tracked.is_empty();
 
-        // Only inline small helpers (<=4 host calls) to avoid
-        // flooding the output from complex enum constructors.
-        if child.tracked.len() <= 4 {
+        // Inline helper functions up to a reasonable limit to
+        // capture token transfers, storage ops, etc.
+        if child.tracked.len() <= 16 {
             state.blocks.extend(child.blocks);
         }
         state.tracked.extend(child.tracked);
@@ -402,7 +582,7 @@ impl AnalyzedModule {
         state.unpack_field_ids.extend(child.unpack_field_ids);
         state.memory_state.extend(child.memory_state);
 
-        let return_expr = child.stack.pop();
+        let return_expr = child.return_value.or_else(|| child.stack.pop());
         let result_val = self.resolve_local_call_result(
             args,
             return_expr,
@@ -540,6 +720,7 @@ impl AnalyzedModule {
                 condition,
                 then_block: then_blocks,
                 else_block: else_blocks,
+                alt_unreachable,
             });
         }
 
@@ -561,7 +742,7 @@ impl AnalyzedModule {
         &self,
         alt_stack: &[StackValue],
         alt_locals: &HashMap<LocalId, StackValue>,
-        cons_memory: &HashMap<(LocalId, i64), StackValue>,
+        cons_memory: &HashMap<(MemBase, i64), StackValue>,
         cons_unreachable: bool,
         alt_unreachable: bool,
         func: &LocalFunction,
@@ -622,6 +803,92 @@ impl AnalyzedModule {
             state.stack.pop().unwrap_or(StackValue::Unknown);
         let left =
             state.stack.pop().unwrap_or(StackValue::Unknown);
+
+        // Constant folding: evaluate i32 ops at simulation time.
+        // This enables br_table to resolve when the discriminant
+        // is a constant masked by i32.and (e.g. `disc & 0xFF`).
+        if let (
+            StackValue::Const(ir::Value::I32(l)),
+            StackValue::Const(ir::Value::I32(r)),
+        ) = (&left, &right)
+        {
+            let folded = match op {
+                BinaryOp::I32Add => Some(l.wrapping_add(*r)),
+                BinaryOp::I32Sub => Some(l.wrapping_sub(*r)),
+                BinaryOp::I32Mul => Some(l.wrapping_mul(*r)),
+                BinaryOp::I32And => Some(l & r),
+                BinaryOp::I32Or => Some(l | r),
+                BinaryOp::I32Xor => Some(l ^ r),
+                BinaryOp::I32Shl => Some(l.wrapping_shl(*r as u32)),
+                BinaryOp::I32ShrU => Some((*l as u32).wrapping_shr(*r as u32) as i32),
+                BinaryOp::I32ShrS => Some(l.wrapping_shr(*r as u32)),
+                _ => None,
+            };
+            if let Some(v) = folded {
+                state.stack.push(StackValue::Const(ir::Value::I32(v)));
+                return;
+            }
+        }
+
+        // Constant folding: evaluate i64 ops at simulation time.
+        // This enables SymbolSmall and other tagged Val constants
+        // constructed via bit manipulation (e.g. `(chars << 8) | 14`)
+        // to be folded into a single Const that try_decode_val can decode.
+        if let (
+            StackValue::Const(ir::Value::I64(l)),
+            StackValue::Const(ir::Value::I64(r)),
+        ) = (&left, &right)
+        {
+            let folded = match op {
+                BinaryOp::I64Add => Some(l.wrapping_add(*r)),
+                BinaryOp::I64Sub => Some(l.wrapping_sub(*r)),
+                BinaryOp::I64Mul => Some(l.wrapping_mul(*r)),
+                BinaryOp::I64And => Some(l & r),
+                BinaryOp::I64Or => Some(l | r),
+                BinaryOp::I64Xor => Some(l ^ r),
+                BinaryOp::I64Shl => Some(l.wrapping_shl(*r as u32)),
+                BinaryOp::I64ShrU => Some((*l as u64).wrapping_shr(*r as u32) as i64),
+                BinaryOp::I64ShrS => Some(l.wrapping_shr(*r as u32)),
+                _ => None,
+            };
+            if let Some(v) = folded {
+                state.stack.push(StackValue::Const(ir::Value::I64(v)));
+                return;
+            }
+        }
+
+        // Mixed constant folding: i32/i64 pairs from type conversions.
+        // The WASM compiler sometimes mixes i32 and i64 constants via
+        // extend/wrap operations. Handle the common case where one
+        // operand is i32 and the other is i64 by promoting to i64.
+        let mixed_i64 = match (&left, &right) {
+            (StackValue::Const(ir::Value::I32(l)), StackValue::Const(ir::Value::I64(r))) => {
+                Some((*l as i64, *r))
+            }
+            (StackValue::Const(ir::Value::I64(l)), StackValue::Const(ir::Value::I32(r))) => {
+                Some((*l, *r as i64))
+            }
+            _ => None,
+        };
+        if let Some((l, r)) = mixed_i64 {
+            let folded = match op {
+                BinaryOp::I64Add => Some(l.wrapping_add(r)),
+                BinaryOp::I64Sub => Some(l.wrapping_sub(r)),
+                BinaryOp::I64Mul => Some(l.wrapping_mul(r)),
+                BinaryOp::I64And => Some(l & r),
+                BinaryOp::I64Or => Some(l | r),
+                BinaryOp::I64Xor => Some(l ^ r),
+                BinaryOp::I64Shl => Some(l.wrapping_shl(r as u32)),
+                BinaryOp::I64ShrU => Some((l as u64).wrapping_shr(r as u32) as i64),
+                BinaryOp::I64ShrS => Some(l.wrapping_shr(r as u32)),
+                _ => None,
+            };
+            if let Some(v) = folded {
+                state.stack.push(StackValue::Const(ir::Value::I64(v)));
+                return;
+            }
+        }
+
         if let Some(ir_op) = map_binop(op) {
             state.stack.push(StackValue::BinOp {
                 op: ir_op,
@@ -647,12 +914,29 @@ impl AnalyzedModule {
                 operand: Box::new(operand),
             });
         } else {
-            // Type conversions propagate the inner value.
+            // Type conversions: fold constants to the target type,
+            // otherwise propagate the inner value transparently.
             match op {
-                UnaryOp::I32WrapI64
-                | UnaryOp::I64ExtendSI32
-                | UnaryOp::I64ExtendUI32 => {
-                    state.stack.push(operand);
+                UnaryOp::I32WrapI64 => {
+                    if let StackValue::Const(ir::Value::I64(v)) = &operand {
+                        state.stack.push(StackValue::Const(ir::Value::I32(*v as i32)));
+                    } else {
+                        state.stack.push(operand);
+                    }
+                }
+                UnaryOp::I64ExtendSI32 => {
+                    if let StackValue::Const(ir::Value::I32(v)) = &operand {
+                        state.stack.push(StackValue::Const(ir::Value::I64(*v as i64)));
+                    } else {
+                        state.stack.push(operand);
+                    }
+                }
+                UnaryOp::I64ExtendUI32 => {
+                    if let StackValue::Const(ir::Value::I32(v)) = &operand {
+                        state.stack.push(StackValue::Const(ir::Value::I64(*v as u32 as i64)));
+                    } else {
+                        state.stack.push(operand);
+                    }
                 }
                 _ => {
                     state.stack.push(StackValue::Unknown);
@@ -662,10 +946,17 @@ impl AnalyzedModule {
     }
 
     /// Simulate a memory load instruction.
+    ///
+    /// First tries resolving from tracked memory stores (memory_state).
+    /// Falls back to reading constant values from the WASM data section
+    /// when the address is a compile-time constant — this handles patterns
+    /// like loading SymbolSmall constants embedded in the data section
+    /// (e.g. event topic symbols loaded via `i64.load` from a static address).
     fn simulate_load(
         &self,
         load: &ir::Load,
         state: &mut SimulationState,
+        _depth: usize,
     ) {
         let addr =
             state.stack.pop().unwrap_or(StackValue::Unknown);
@@ -678,9 +969,57 @@ impl AnalyzedModule {
                     .cloned()
                     .unwrap_or(StackValue::Unknown)
             } else {
-                StackValue::Unknown
+                // Try to evaluate the address as a constant for data section reads.
+                self.try_load_from_data_section(&addr, load)
+                    .unwrap_or(StackValue::Unknown)
             };
         state.stack.push(result);
+    }
+
+    /// Try to load a value from the WASM data section at a constant address.
+    ///
+    /// When the WASM code loads from a compile-time constant address (e.g.
+    /// `i32.const 1048576; i64.load`), this reads the bytes from the data
+    /// section and returns the appropriate `StackValue::Const`.
+    fn try_load_from_data_section(
+        &self,
+        addr: &StackValue,
+        load: &ir::Load,
+    ) -> Option<StackValue> {
+        // Evaluate the address to a constant.
+        let base_addr = match addr {
+            StackValue::Const(ir::Value::I32(v)) => *v as u64,
+            StackValue::Const(ir::Value::I64(v)) => *v as u64,
+            _ => return None,
+        };
+        let eff_addr = base_addr + load.arg.offset as u64;
+
+        // Determine load size from the kind.
+        let load_size = load.kind.width();
+
+        // Read bytes from the data section.
+        let bytes = self.read_linear_memory(eff_addr as u32, load_size as u32)?;
+
+        // Convert to the appropriate StackValue based on load kind.
+        match load.kind {
+            ir::LoadKind::I64 { .. } => {
+                if bytes.len() == 8 {
+                    let val = i64::from_le_bytes(bytes.try_into().ok()?);
+                    Some(StackValue::Const(ir::Value::I64(val)))
+                } else {
+                    None
+                }
+            }
+            ir::LoadKind::I32 { .. } => {
+                if bytes.len() == 4 {
+                    let val = i32::from_le_bytes(bytes.try_into().ok()?);
+                    Some(StackValue::Const(ir::Value::I32(val)))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Simulate a memory store instruction.
@@ -688,14 +1027,15 @@ impl AnalyzedModule {
         &self,
         store: &ir::Store,
         state: &mut SimulationState,
+        _depth: usize,
     ) {
         let val =
             state.stack.pop().unwrap_or(StackValue::Unknown);
         let addr =
             state.stack.pop().unwrap_or(StackValue::Unknown);
-        if let Some((lid, base)) = decompose_address(&addr) {
+        if let Some((base_id, base)) = decompose_address(&addr) {
             let eff = base + store.arg.offset as i64;
-            state.memory_state.insert((lid, eff), val);
+            state.memory_state.insert((base_id, eff), val);
         }
     }
 }
@@ -716,6 +1056,34 @@ fn seq_ends_unreachable(
 ) -> bool {
     let seq = func.block(seq_id);
     seq.instrs
+        .last()
+        .map_or(false, |(i, _)| matches!(i, Instr::Unreachable(_)))
+}
+
+/// Check if a slice of remaining instructions contains any function calls
+/// (host or local). Used by `BrIf` handling to decide whether to model
+/// the conditional branch as an `AnalyzedBlock::If`.
+fn remaining_has_calls(instrs: &[(Instr, ir::InstrLocId)]) -> bool {
+    for (instr, _) in instrs {
+        match instr {
+            Instr::Call(_) => return true,
+            Instr::Block(b) => {
+                // We can't easily inspect the block's seq here without
+                // the func reference, but calls inside blocks are common.
+                // Conservatively return true for non-empty blocks.
+                let _ = b;
+            }
+            Instr::IfElse(_) => return true,
+            Instr::Loop(_) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Check if a slice of instructions ends in `Unreachable`.
+fn remaining_ends_unreachable(instrs: &[(Instr, ir::InstrLocId)]) -> bool {
+    instrs
         .last()
         .map_or(false, |(i, _)| matches!(i, Instr::Unreachable(_)))
 }

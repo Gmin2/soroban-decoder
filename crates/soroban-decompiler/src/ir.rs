@@ -72,6 +72,24 @@ pub enum Statement {
         /// The loop body.
         body: Vec<Statement>,
     },
+    /// A for-each loop: `for var_name in collection.iter() { ... }`
+    ForEach {
+        /// The iteration variable name.
+        var_name: String,
+        /// The collection being iterated over.
+        collection: Expr,
+        /// The loop body.
+        body: Vec<Statement>,
+    },
+    /// A for-range loop: `for var_name in 0..bound { ... }`
+    ForRange {
+        /// The iteration variable name.
+        var_name: String,
+        /// The upper bound expression.
+        bound: Expr,
+        /// The loop body.
+        body: Vec<Statement>,
+    },
 }
 
 /// An expression in the decompiled IR.
@@ -151,6 +169,11 @@ pub enum Expr {
         /// Tuple fields (empty for unit variants).
         fields: Vec<Expr>,
     },
+    /// A borrow reference expression: `&inner`.
+    ///
+    /// Used for storage key/value arguments that need `&` (e.g.,
+    /// `.get(&key)`, `.set(&key, &val)`).
+    Ref(Box<Expr>),
     /// An unrecognized WASM pattern preserved as a descriptive string.
     ///
     /// These render as `todo!("description")` in the generated code and
@@ -182,6 +205,8 @@ pub enum Literal {
     Bool(bool),
     /// A string literal (used for symbol names, storage keys, etc.).
     Str(String),
+    /// Unit value `()`.
+    Unit,
 }
 
 /// Binary operators supported in the IR.

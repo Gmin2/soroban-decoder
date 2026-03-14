@@ -112,6 +112,15 @@ impl AnalyzedModule {
                 break;
             }
 
+            // Count instructions to distinguish wrappers from real functions.
+            // Wrappers are very short (call + return), while real functions
+            // have arithmetic, branches, etc.
+            let stats = self.analyze_function_body(current);
+            if stats.instruction_count > 10 || stats.has_branches || stats.has_loops {
+                // Too complex to be a simple wrapper — this is the impl.
+                break;
+            }
+
             // If exactly one local call target and no host calls, it's a wrapper.
             if unique_local_calls.len() == 1 {
                 current = unique_local_calls[0];

@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use walrus::{ExportItem, FunctionId, LocalId, Module};
+use walrus::{ExportItem, FunctionId, GlobalId, LocalId, Module};
 use walrus::ir;
 
 use crate::host_functions::{self, HostFunction};
@@ -69,6 +69,13 @@ pub struct HostCallSite {
     pub raw_field: String,
 }
 
+/// A base address for memory tracking — either a local variable or a global.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemBase {
+    Local(LocalId),
+    Global(GlobalId),
+}
+
 /// An abstract value tracked during stack simulation.
 #[derive(Debug, Clone)]
 pub enum StackValue {
@@ -78,6 +85,9 @@ pub enum StackValue {
     Param(usize),
     /// A local variable we couldn't resolve further.
     Local(LocalId),
+    /// A global variable (e.g. shadow stack pointer `$__stack_pointer`).
+    /// Tracked symbolically so frame-relative address arithmetic works.
+    Global(GlobalId),
     /// Return value from a function call, identified by unique call-site ID.
     CallResult(usize),
     /// A binary operation on two tracked values.
@@ -116,6 +126,8 @@ pub enum AnalyzedBlock {
         condition: Option<StackValue>,
         then_block: Vec<AnalyzedBlock>,
         else_block: Vec<AnalyzedBlock>,
+        /// True when the else branch ends in unreachable (error/trap path).
+        alt_unreachable: bool,
     },
     /// A loop block.
     Loop {
@@ -151,10 +163,10 @@ pub struct FunctionStackAnalysis {
     /// Maps the unpack call_site_id to synthetic field CallResult IDs.
     pub unpack_field_ids: HashMap<usize, Vec<usize>>,
 
-    /// Memory state: maps `(LocalId, offset)` to [`StackValue`] for
+    /// Memory state: maps `(MemBase, offset)` to [`StackValue`] for
     /// stores through pointers. Propagated from callees so that caller
     /// loads can resolve callee-written values.
-    pub memory_state: HashMap<(LocalId, i64), StackValue>,
+    pub memory_state: HashMap<(MemBase, i64), StackValue>,
 }
 
 impl AnalyzedModule {

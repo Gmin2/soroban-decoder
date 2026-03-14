@@ -3,12 +3,34 @@
 /// Handles Soroban's tagged Val format (64-bit words with type tags),
 /// symbol decoding, and resolution of stack values to IR expressions.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use walrus::ir::Value;
 
 use crate::ir::{Expr, Literal};
 use crate::wasm_analysis::{AnalyzedModule, StackValue, TrackedHostCall};
+
+thread_local! {
+    /// Thread-local memory strings map, set during the recognize pass
+    /// so that `resolve_arg_inner` can resolve unnamed CallResults to
+    /// their decoded string/symbol literals without changing every call site.
+    static MEMORY_STRINGS: RefCell<HashMap<usize, String>> = RefCell::new(HashMap::new());
+}
+
+/// Set the thread-local memory strings for the current recognize pass.
+pub fn set_memory_strings(strings: &HashMap<usize, String>) {
+    MEMORY_STRINGS.with(|ms| {
+        *ms.borrow_mut() = strings.clone();
+    });
+}
+
+/// Clear the thread-local memory strings.
+pub fn clear_memory_strings() {
+    MEMORY_STRINGS.with(|ms| {
+        ms.borrow_mut().clear();
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Soroban Val / Symbol decoding
@@ -357,12 +379,20 @@ fn try_decode_val(val: i64) -> Option<Expr> {
         0 if v == 0 => Some(Expr::Literal(Literal::I64(0))),
         1 if v >> 8 == 0 => Some(Expr::Literal(Literal::I64(1))),
         // Void (tag 2): body must be 0
-        2 if v >> 8 == 0 => Some(Expr::Raw("/* void */".into())),
+        2 if v >> 8 == 0 => Some(Expr::Literal(Literal::Unit)),
         // Error (tag 3): major = error code, minor = error type
+        // For contract errors (type 0), emit a Var with a canonical
+        // format that codegen resolves to the actual error enum variant.
         3 => {
             let error_code = (v >> 32) as u32;
             let error_type = ((v >> 8) & 0xFF_FFFF) as u32;
-            Some(Expr::Raw(format!("/* Error(type={error_type}, code={error_code}) */")))
+            if error_type == 0 {
+                // Contract error — code maps to #[contracterror] variant.
+                // Use a magic prefix that codegen recognizes and replaces.
+                Some(Expr::Var(format!("__contract_error_{error_code}")))
+            } else {
+                Some(Expr::Raw(format!("/* Error(type={error_type}, code={error_code}) */")))
+            }
         }
         // U32Val (tag 4): value in bits 32-63
         4 => {
@@ -381,6 +411,21 @@ fn try_decode_val(val: i64) -> Option<Expr> {
         }
         // I64Small (tag 7): value in bits 8-63 (sign-extended 56-bit)
         7 => {
+            let body = v >> 8;
+            let value = if body & (1 << 55) != 0 {
+                (body | 0xFF00_0000_0000_0000) as i64
+            } else {
+                body as i64
+            };
+            Some(Expr::Literal(Literal::I64(value)))
+        }
+        // U128Small (tag 10): 56-bit unsigned u128 in bits 8-63
+        10 => {
+            let value = v >> 8;
+            Some(Expr::Literal(Literal::I64(value as i64)))
+        }
+        // I128Small (tag 11): 56-bit signed i128 in bits 8-63
+        11 => {
             let body = v >> 8;
             let value = if body & (1 << 55) != 0 {
                 (body | 0xFF00_0000_0000_0000) as i64
@@ -411,6 +456,8 @@ pub fn resolve_arg(
     let stripped = strip_val_boilerplate(val);
     resolve_arg_inner(&stripped, param_names, call_result_names)
 }
+
+
 
 /// Inner resolver without stripping (avoids redundant re-stripping in recursion).
 fn resolve_arg_inner(
@@ -450,7 +497,15 @@ fn resolve_arg_inner(
             if let Some(var_name) = call_result_names.get(call_id) {
                 Expr::Var(var_name.clone())
             } else {
-                Expr::Raw("/* computed */".into())
+                // Try to resolve from decoded memory strings (symbol/string literals).
+                let from_mem = MEMORY_STRINGS.with(|ms| {
+                    ms.borrow().get(call_id).cloned()
+                });
+                if let Some(s) = from_mem {
+                    Expr::Literal(Literal::Str(s))
+                } else {
+                    Expr::Raw("/* computed */".into())
+                }
             }
         }
         StackValue::BinOp { op, left, right } => {
@@ -469,18 +524,19 @@ fn resolve_arg_inner(
                 operand: Box::new(e),
             }
         }
+        StackValue::Global(_) => Expr::Raw("/* global */".into()),
         StackValue::Unknown => Expr::Raw("/* unknown */".into()),
     }
 }
 
 /// Wrap an expression in a reference (`&expr`) for contexts that need borrows.
 ///
-/// Skips wrapping for `env` and already-referenced variables.
+/// Skips wrapping for `env`, already-referenced variables, and `Ref` nodes.
 pub fn as_ref(expr: Expr) -> Expr {
     match &expr {
         Expr::Var(name) if name == "env" => expr,
         Expr::Var(name) if name.starts_with('&') => expr,
-        Expr::Var(name) => Expr::Var(format!("&{name}")),
-        _ => expr,
+        Expr::Ref(_) => expr,
+        _ => Expr::Ref(Box::new(expr)),
     }
 }

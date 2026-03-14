@@ -150,6 +150,7 @@ fn main() -> Result<()> {
                             condition,
                             then_block,
                             else_block,
+                            ..
                         } => {
                             println!("{pad}If ({condition:?}) {{");
                             dump_blocks(then_block, indent + 2);
@@ -179,9 +180,9 @@ fn main() -> Result<()> {
                 .iter()
                 .filter(|(_, v)| !matches!(v, StackValue::Unknown))
                 .collect();
-            entries.sort_by_key(|((lid, off), _)| (lid.index(), *off));
-            for ((lid, off), val) in entries {
-                println!("  ({:?}, {}) = {:?}", lid, off, val);
+            entries.sort_by_key(|((base, off), _)| (format!("{base:?}"), *off));
+            for ((base, off), val) in entries {
+                println!("  ({:?}, {}) = {:?}", base, off, val);
             }
         }
     }
