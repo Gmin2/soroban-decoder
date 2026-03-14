@@ -185,14 +185,34 @@ fn generate_tokens(entries: &[ScSpecEntry], analysis: Option<&AnalyzedModule>) -
     }
 
     let mut type_defs = Vec::new();
-    let mut fns = Vec::new();
+    let mut regular_fns = Vec::new();
+    let mut trait_fns = Vec::new();
     let mut body_irs = Vec::new();
+
+    // Extract __check_auth spec for associated type detection.
+    let check_auth_spec = if is_account_contract {
+        entries.iter().find_map(|e| {
+            if let ScSpecEntry::FunctionV0(f) = e {
+                if f.name.to_utf8_string_lossy() == "__check_auth" {
+                    return Some(f);
+                }
+            }
+            None
+        })
+    } else {
+        None
+    };
 
     for entry in entries {
         match entry {
             ScSpecEntry::FunctionV0(f) => {
+                let fn_name = f.name.to_utf8_string_lossy();
                 let body_ir = analysis.and_then(|a| pattern_recognizer::recognize(a, f, entries));
-                fns.push(emit::gen_function(f, body_ir.as_ref()));
+                if is_account_contract && fn_name == "__check_auth" {
+                    trait_fns.push(emit::gen_trait_function(f, body_ir.as_ref()));
+                } else {
+                    regular_fns.push(emit::gen_function(f, body_ir.as_ref()));
+                }
                 if let Some(ir) = body_ir {
                     body_irs.push(ir);
                 }
@@ -218,20 +238,66 @@ fn generate_tokens(entries: &[ScSpecEntry], analysis: Option<&AnalyzedModule>) -
         }
     }
 
-    quote! {
-        #![no_std]
+    if is_account_contract {
+        // Extract associated types from __check_auth signature.
+        // Signature type = 2nd parameter (index 1: after signature_payload).
+        // Error type = error side of Result<(), ErrorType> return.
+        let sig_type = check_auth_spec
+            .and_then(|s| s.inputs.get(1))
+            .map(|input| types::gen_type_ident(&input.type_))
+            .unwrap_or_else(|| quote! { () });
 
-        use soroban_sdk::{#(#use_parts),*};
-        #(#extra_use_stmts)*
+        let err_type = check_auth_spec
+            .and_then(|s| s.outputs.to_option())
+            .and_then(|t| {
+                if let stellar_xdr::ScSpecTypeDef::Result(r) = t {
+                    Some(types::gen_type_ident(&r.error_type))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| quote! { () });
 
-        #(#type_defs)*
+        quote! {
+            #![no_std]
 
-        #[contract]
-        pub struct Contract;
+            use soroban_sdk::{#(#use_parts),*};
+            #(#extra_use_stmts)*
 
-        #[contractimpl]
-        impl Contract {
-            #(#fns)*
+            #(#type_defs)*
+
+            #[contract]
+            pub struct Contract;
+
+            #[contractimpl]
+            impl Contract {
+                #(#regular_fns)*
+            }
+
+            #[contractimpl(contracttrait)]
+            impl CustomAccountInterface for Contract {
+                type Signature = #sig_type;
+                type Error = #err_type;
+
+                #(#trait_fns)*
+            }
+        }
+    } else {
+        quote! {
+            #![no_std]
+
+            use soroban_sdk::{#(#use_parts),*};
+            #(#extra_use_stmts)*
+
+            #(#type_defs)*
+
+            #[contract]
+            pub struct Contract;
+
+            #[contractimpl]
+            impl Contract {
+                #(#regular_fns)*
+            }
         }
     }
 }

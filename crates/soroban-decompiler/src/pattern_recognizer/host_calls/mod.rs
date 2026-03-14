@@ -498,7 +498,7 @@ pub fn recognize_call(
         }),
 
         // Cross-contract calls
-        "call" => context::recognize_cross_contract_call(call, pn, crn),
+        "call" => context::recognize_cross_contract_call(call, pn, crn, ctx),
 
         // Logging — skip in decompilation
         "log_from_linear_memory" => None,

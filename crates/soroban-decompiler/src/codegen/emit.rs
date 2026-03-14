@@ -13,6 +13,15 @@ use crate::ir;
 use super::types::gen_type_ident;
 
 pub(super) fn gen_function(spec: &ScSpecFunctionV0, body_ir: Option<&ir::FunctionIR>) -> TokenStream {
+    gen_function_inner(spec, body_ir, false)
+}
+
+/// Generate a trait impl function (`fn` instead of `pub fn`, with `#[allow(non_snake_case)]`).
+pub(super) fn gen_trait_function(spec: &ScSpecFunctionV0, body_ir: Option<&ir::FunctionIR>) -> TokenStream {
+    gen_function_inner(spec, body_ir, true)
+}
+
+fn gen_function_inner(spec: &ScSpecFunctionV0, body_ir: Option<&ir::FunctionIR>, is_trait_fn: bool) -> TokenStream {
     let fn_ident = format_ident!("{}", spec.name.to_utf8_string_lossy());
 
     let fn_inputs = spec.inputs.iter().map(|input| {
@@ -149,10 +158,20 @@ pub(super) fn gen_function(spec: &ScSpecFunctionV0, body_ir: Option<&ir::Functio
         quote! {}
     };
 
-    quote! {
-        pub fn #fn_ident(env: Env, #(#fn_inputs),*) #fn_output {
-            #local_decls
-            #body
+    if is_trait_fn {
+        quote! {
+            #[allow(non_snake_case)]
+            fn #fn_ident(env: Env, #(#fn_inputs),*) #fn_output {
+                #local_decls
+                #body
+            }
+        }
+    } else {
+        quote! {
+            pub fn #fn_ident(env: Env, #(#fn_inputs),*) #fn_output {
+                #local_decls
+                #body
+            }
         }
     }
 }
@@ -376,10 +395,20 @@ pub(super) fn gen_expr(expr: &ir::Expr) -> TokenStream {
             }
         }
         ir::Expr::HostCall { module, name, args } => {
-            let mod_ident = format_ident!("{}", module);
-            let fn_ident = format_ident!("{}", name);
             let arg_tokens: Vec<TokenStream> = args.iter().map(gen_expr).collect();
-            quote! { #mod_ident::#fn_ident(#(#arg_tokens),*) }
+            // Support path-style modules like "token::Client"
+            if module.contains("::") {
+                let path: TokenStream = module.parse().unwrap_or_else(|_| {
+                    let ident = format_ident!("{}", module.replace("::", "_"));
+                    quote! { #ident }
+                });
+                let fn_ident = format_ident!("{}", name);
+                quote! { #path::#fn_ident(#(#arg_tokens),*) }
+            } else {
+                let mod_ident = format_ident!("{}", module);
+                let fn_ident = format_ident!("{}", name);
+                quote! { #mod_ident::#fn_ident(#(#arg_tokens),*) }
+            }
         }
         ir::Expr::MethodChain { receiver, calls } => {
             let mut tokens = gen_expr(receiver);

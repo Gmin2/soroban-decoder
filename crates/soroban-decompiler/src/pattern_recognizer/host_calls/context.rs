@@ -99,10 +99,38 @@ pub(super) fn recognize_cross_contract_call(
     call: &TrackedHostCall,
     param_names: &[String],
     crn: &HashMap<usize, String>,
+    ctx: &RecognitionContext,
 ) -> Option<Statement> {
     let addr = as_ref(resolve_arg(call.args.first()?, param_names, crn));
     let func = resolve_arg(call.args.get(1)?, param_names, crn);
-    let args = resolve_arg(call.args.get(2)?, param_names, crn);
+    let args_expr = resolve_arg(call.args.get(2)?, param_names, crn);
+
+    // Detect token client calls by checking if the function name is a known
+    // token interface method. If so, emit `token::Client::new(&env, &addr).method(args...)`
+    // instead of the generic `env.invoke_contract(...)`.
+    let token_method = extract_token_method_name(&func);
+    if let Some(method_name) = token_method {
+        // Resolve the vec contents to get individual arguments.
+        let vec_args = extract_vec_call_args(call.args.get(2)?, ctx, param_names, crn);
+
+        let client = Expr::MethodChain {
+            receiver: Box::new(Expr::HostCall {
+                module: "token::Client".into(),
+                name: "new".into(),
+                args: vec![Expr::Var("&env".into()), addr],
+            }),
+            calls: vec![MethodCall {
+                name: method_name.into(),
+                args: vec_args.iter().map(|a| as_ref(a.clone())).collect(),
+            }],
+        };
+
+        return Some(Statement::Let {
+            name: "result".into(),
+            mutable: false,
+            value: client,
+        });
+    }
 
     Some(Statement::Let {
         name: "result".into(),
@@ -111,10 +139,58 @@ pub(super) fn recognize_cross_contract_call(
             receiver: Box::new(Expr::Var("env".into())),
             calls: vec![MethodCall {
                 name: "invoke_contract".into(),
-                args: vec![addr, func, args],
+                args: vec![addr, func, args_expr],
             }],
         },
     })
+}
+
+/// Check if an expression is a known token interface method name.
+fn extract_token_method_name(func_expr: &Expr) -> Option<&'static str> {
+    match func_expr {
+        Expr::MacroCall { name, args } if name == "symbol_short" => {
+            if let Some(Expr::Literal(crate::ir::Literal::Str(s))) = args.first() {
+                match s.as_str() {
+                    "transfer" => Some("transfer"),
+                    "burn" => Some("burn"),
+                    "approve" => Some("approve"),
+                    "balance" => Some("balance"),
+                    "decimals" => Some("decimals"),
+                    "name" => Some("name"),
+                    "symbol" => Some("symbol"),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract individual arguments from a vec CallResult for token client calls.
+fn extract_vec_call_args(
+    vec_sv: &StackValue,
+    ctx: &RecognitionContext,
+    param_names: &[String],
+    crn: &HashMap<usize, String>,
+) -> Vec<Expr> {
+    // The vec arg is typically a CallResult pointing to a vec_new_from_linear_memory.
+    if let StackValue::CallResult(vec_id) = strip_val_boilerplate(vec_sv) {
+        if let Some(elements) = ctx.vec_contents.get(&vec_id) {
+            // Skip the first element if it's &env (already handled by Client::new)
+            let skip = if elements.first().map_or(false, |e| matches!(e, StackValue::Param(0))) {
+                1
+            } else {
+                0
+            };
+            return elements[skip..].iter().map(|el| {
+                let stripped = strip_val_boilerplate(el);
+                resolve_arg(&stripped, param_names, crn)
+            }).collect();
+        }
+    }
+    vec![]
 }
 
 /// Recognize `extend_contract_data_ttl(key, type, threshold, extend_to)`

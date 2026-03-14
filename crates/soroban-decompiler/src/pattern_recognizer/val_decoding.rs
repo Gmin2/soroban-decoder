@@ -366,7 +366,11 @@ pub fn decode_keys_from_linear_memory(
 /// and the upper bits carry the payload. This function decodes:
 ///   Tag 0 = False, Tag 1 = True, Tag 2 = Void,
 ///   Tag 3 = Error, Tag 4 = U32Val, Tag 5 = I32Val,
-///   Tag 6 = U64Small, Tag 7 = I64Small, Tag 14 = SymbolSmall.
+///   Tag 6 = U64Small, Tag 7 = I64Small,
+///   Tag 8 = TimepointSmall, Tag 9 = DurationSmall,
+///   Tag 10 = U128Small, Tag 11 = I128Small,
+///   Tag 12 = U256Small, Tag 13 = I256Small,
+///   Tag 14 = SymbolSmall.
 fn try_decode_val(val: i64) -> Option<Expr> {
     let v = val as u64;
     let tag = v & 0xFF;
@@ -419,6 +423,16 @@ fn try_decode_val(val: i64) -> Option<Expr> {
             };
             Some(Expr::Literal(Literal::I64(value)))
         }
+        // TimepointSmall (tag 8): 56-bit unsigned timepoint in bits 8-63
+        8 => {
+            let value = v >> 8;
+            Some(Expr::Literal(Literal::I64(value as i64)))
+        }
+        // DurationSmall (tag 9): 56-bit unsigned duration in bits 8-63
+        9 => {
+            let value = v >> 8;
+            Some(Expr::Literal(Literal::I64(value as i64)))
+        }
         // U128Small (tag 10): 56-bit unsigned u128 in bits 8-63
         10 => {
             let value = v >> 8;
@@ -426,6 +440,21 @@ fn try_decode_val(val: i64) -> Option<Expr> {
         }
         // I128Small (tag 11): 56-bit signed i128 in bits 8-63
         11 => {
+            let body = v >> 8;
+            let value = if body & (1 << 55) != 0 {
+                (body | 0xFF00_0000_0000_0000) as i64
+            } else {
+                body as i64
+            };
+            Some(Expr::Literal(Literal::I64(value)))
+        }
+        // U256Small (tag 12): 56-bit unsigned u256 in bits 8-63
+        12 => {
+            let value = v >> 8;
+            Some(Expr::Literal(Literal::I64(value as i64)))
+        }
+        // I256Small (tag 13): 56-bit signed i256 in bits 8-63
+        13 => {
             let body = v >> 8;
             let value = if body & (1 << 55) != 0 {
                 (body | 0xFF00_0000_0000_0000) as i64
