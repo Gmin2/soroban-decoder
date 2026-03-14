@@ -739,6 +739,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "soroban-decompiler-bench"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn",
+]
+
+[[package]]
 name = "soroban-decompiler-cli"
 version = "0.2.2"
 dependencies = [

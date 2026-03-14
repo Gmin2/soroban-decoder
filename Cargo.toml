@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/soroban-decompiler",
     "crates/soroban-decompiler-cli",
+    "crates/soroban-decompiler-bench",
 ]
 
 [workspace.package]
