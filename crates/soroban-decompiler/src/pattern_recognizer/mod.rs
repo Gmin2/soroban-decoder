@@ -532,6 +532,11 @@ fn build_statements_from_blocks(
                     // `amount_b < min_b_for_a`). Skip SDK-generated guards:
                     // type tag checks, decode checks, overflow checks, and
                     // any non-comparison expressions.
+                    // Decode U32Val-space comparison constants. The WASM
+                    // compiler generates `result < (N << 32)` for fast
+                    // length checks without decoding the U32Val.
+                    let cond_expr = decode_val_comparison_constants(cond_expr);
+
                     let is_user_precondition = is_user_comparison(&cond_expr);
 
                     if is_user_precondition {
@@ -769,6 +774,44 @@ fn scan_loop_body_nested(
         }
         AnalyzedBlock::HostCall(_) => {}
     }
+}
+
+/// Decode Val-encoded comparison constants in guard conditions.
+///
+/// The WASM compiler generates fast comparisons like `result < (1 << 32)`
+/// to check U32Val-encoded lengths without decoding. This function detects
+/// large constants (> 2^31) in comparisons and decodes them by shifting
+/// right 32 bits (extracting the U32Val value portion).
+fn decode_val_comparison_constants(expr: Expr) -> Expr {
+    use crate::ir::BinOp as B;
+    match expr {
+        Expr::BinOp { op: op @ (B::Lt | B::Le | B::Gt | B::Ge | B::Eq | B::Ne), left, right } => {
+            let new_left = decode_large_literal(*left);
+            let new_right = decode_large_literal(*right);
+            Expr::BinOp { op, left: Box::new(new_left), right: Box::new(new_right) }
+        }
+        other => other,
+    }
+}
+
+/// If an expression is a large I64 literal that looks like a Val-encoded
+/// constant (value > 2^31 with meaningful upper 32 bits), decode it.
+fn decode_large_literal(expr: Expr) -> Expr {
+    match &expr {
+        Expr::Literal(crate::ir::Literal::I64(v)) => {
+            let uv = *v as u64;
+            // U32Val-space threshold: value >= 2^32, decode upper 32 bits
+            if uv >= (1u64 << 32) && uv <= (u32::MAX as u64) << 32 | 0xFFFFFFFF {
+                let decoded = (uv >> 32) as i64;
+                // Only decode if the result is a reasonable small number
+                if decoded >= 0 && decoded <= 1000 {
+                    return Expr::Literal(crate::ir::Literal::I64(decoded));
+                }
+            }
+        }
+        _ => {}
+    }
+    expr
 }
 
 /// Check if an expression is a user-level comparison suitable for
@@ -1308,21 +1351,23 @@ fn try_resolve_key_in_method_chain(
                     None
                 };
 
+                // `has` operations peek at the next variant without consuming it.
+                // They check existence of the same key that a subsequent get/set uses.
+                let is_peek = storage_call.name == "has";
+
                 let idx = if let Some(&existing) = key_map.get(&key_sig) {
-                    // Same key expression seen before → reuse same variant
                     existing
                 } else if let Some(last_idx) = reuse_last {
-                    // Remove: reuse the variant from the last get/has
                     last_idx
                 } else if is_void_value {
                     // Void value → pick marker-sounding variant
                     let idx = *next_mark;
-                    *next_mark = (*next_mark + 1).min(variants.len());
+                    if !is_peek { *next_mark = (*next_mark + 1).min(variants.len()); }
                     idx
                 } else {
                     // Struct/value → pick substantive variant
                     let idx = *next_sub;
-                    *next_sub = (*next_sub + 1).min(variants.len());
+                    if !is_peek { *next_sub = (*next_sub + 1).min(variants.len()); }
                     idx
                 };
                 key_map.insert(key_sig, idx);
