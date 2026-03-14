@@ -128,6 +128,10 @@ pub enum AnalyzedBlock {
         else_block: Vec<AnalyzedBlock>,
         /// True when the else branch ends in unreachable (error/trap path).
         alt_unreachable: bool,
+        /// True when this If represents a guard/precondition check:
+        /// `if condition { panic!() }` — the taken path traps, the
+        /// continuation should be flat (not nested inside else).
+        guard_trap: bool,
     },
     /// A loop block.
     Loop {

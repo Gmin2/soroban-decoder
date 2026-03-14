@@ -176,15 +176,12 @@ fn extract_vec_call_args(
     crn: &HashMap<usize, String>,
 ) -> Vec<Expr> {
     // The vec arg is typically a CallResult pointing to a vec_new_from_linear_memory.
+    // The vec elements are the user arguments to the token method (from, to,
+    // amount, etc.). They never include &env — the SDK compiler uses env for
+    // the vec construction machinery but does not store it as an element.
     if let StackValue::CallResult(vec_id) = strip_val_boilerplate(vec_sv) {
         if let Some(elements) = ctx.vec_contents.get(&vec_id) {
-            // Skip the first element if it's &env (already handled by Client::new)
-            let skip = if elements.first().map_or(false, |e| matches!(e, StackValue::Param(0))) {
-                1
-            } else {
-                0
-            };
-            return elements[skip..].iter().map(|el| {
+            return elements.iter().map(|el| {
                 let stripped = strip_val_boilerplate(el);
                 resolve_arg(&stripped, param_names, crn)
             }).collect();

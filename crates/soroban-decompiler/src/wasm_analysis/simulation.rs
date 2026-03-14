@@ -3,7 +3,7 @@
 /// Simulates the WASM operand stack to track values flowing through
 /// local variables, function calls, and memory operations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use walrus::{FunctionId, FunctionKind, LocalFunction, LocalId, Module};
 use walrus::ir::{self, BinaryOp, Instr, InstrSeqId, InstrSeqType, UnaryOp};
@@ -24,6 +24,15 @@ struct SimulationState {
     tracked: Vec<TrackedHostCall>,
     blocks: Vec<AnalyzedBlock>,
     locals_state: HashMap<LocalId, StackValue>,
+    /// Tracks the current value of each WASM global variable.
+    ///
+    /// The Soroban shadow stack pointer (`__stack_pointer`, Global 0)
+    /// changes across function calls as each function allocates its
+    /// frame: `global.get 0; i32.const N; i32.sub; global.set 0`.
+    /// By tracking these updates, stores from different functions
+    /// get distinct memory keys (e.g. `(Global(0), -48 + offset)` vs
+    /// `(Global(0), -112 + offset)`) instead of colliding.
+    globals_state: HashMap<walrus::GlobalId, StackValue>,
     memory_state: HashMap<(MemBase, i64), StackValue>,
     vec_contents: HashMap<usize, Vec<StackValue>>,
     map_contents: HashMap<usize, (Vec<String>, Vec<StackValue>)>,
@@ -32,6 +41,11 @@ struct SimulationState {
     /// Captured return value when `Return` instruction is hit inside a
     /// nested block. This prevents the Block drain from discarding it.
     return_value: Option<StackValue>,
+    /// Current loop nesting depth.
+    loop_depth: usize,
+    /// Set of block InstrSeqIds where br_if taken path leads to a trap.
+    /// Used to detect guard/precondition patterns.
+    guard_blocks: HashSet<InstrSeqId>,
 }
 
 impl SimulationState {
@@ -42,12 +56,15 @@ impl SimulationState {
             tracked: Vec::new(),
             blocks: Vec::new(),
             locals_state: HashMap::new(),
+            globals_state: HashMap::new(),
             memory_state: HashMap::new(),
             vec_contents: HashMap::new(),
             map_contents: HashMap::new(),
             unpack_field_ids: HashMap::new(),
             next_call_id: 0,
             return_value: None,
+            loop_depth: 0,
+            guard_blocks: HashSet::new(),
         }
     }
 
@@ -119,6 +136,9 @@ impl AnalyzedModule {
                 .unwrap_or(StackValue::Param(i));
             state.locals_state.insert(*arg_id, val);
         }
+
+        // Pre-pass: identify guard blocks (blocks followed by unreachable).
+        state.guard_blocks = collect_guard_blocks(local_func);
 
         self.simulate_seq(
             local_func,
@@ -192,10 +212,18 @@ impl AnalyzedModule {
                     }
                 }
                 Instr::GlobalGet(gg) => {
-                    state.stack.push(StackValue::Global(gg.global));
+                    let val = state.globals_state
+                        .get(&gg.global)
+                        .cloned()
+                        .unwrap_or(StackValue::Global(gg.global));
+                    state.stack.push(val);
                 }
-                Instr::GlobalSet(_) => {
-                    state.stack.pop();
+                Instr::GlobalSet(gs) => {
+                    if let Some(val) = state.stack.pop() {
+                        if !contains_unknown(&val) {
+                            state.globals_state.insert(gs.global, val);
+                        }
+                    }
                 }
                 Instr::Call(call) => {
                     self.simulate_call(
@@ -292,6 +320,23 @@ impl AnalyzedModule {
                     let condition = state.stack.pop();
                     let remaining = &instrs[idx..];
 
+                    // Guard pattern: when br_if targets a block that's
+                    // followed by unreachable, the taken path is a trap
+                    // (panic). Emit a flat guard statement and continue
+                    // processing remaining instructions as siblings.
+                    if state.guard_blocks.contains(&_br.block) {
+                        state.blocks.push(AnalyzedBlock::If {
+                            condition,
+                            then_block: vec![],
+                            else_block: vec![],
+                            alt_unreachable: true,
+                            guard_trap: true,
+                        });
+                        // DON'T break — continue processing remaining
+                        // instructions flat (not nested inside if).
+                        continue;
+                    }
+
                     // Check if the remaining instructions contain any
                     // host calls or meaningful control flow. If so,
                     // model the br_if as an AnalyzedBlock::If where
@@ -332,6 +377,7 @@ impl AnalyzedModule {
                                 then_block: vec![],
                                 else_block: cont_blocks,
                                 alt_unreachable: cont_ends_unreachable,
+                                guard_trap: false,
                             });
                         }
 
@@ -562,6 +608,7 @@ impl AnalyzedModule {
         let mut child = SimulationState::new();
         child.next_call_id = state.next_call_id;
         child.memory_state = state.memory_state.clone();
+        child.globals_state = state.globals_state.clone();
 
         self.analyze_function_stack_inner(
             callee_id, args, depth + 1, &mut child,
@@ -646,19 +693,64 @@ impl AnalyzedModule {
         state: &mut SimulationState,
         depth: usize,
     ) {
-        let saved_blocks = std::mem::take(&mut state.blocks);
-        self.simulate_seq(func, l.seq, state, depth);
-        let loop_blocks = std::mem::replace(
-            &mut state.blocks,
-            saved_blocks,
-        );
-
         let has_back_edge = seq_has_back_edge(func, l.seq);
-        if !loop_blocks.is_empty() {
-            state.blocks.push(AnalyzedBlock::Loop {
-                body: loop_blocks,
-                has_back_edge,
-            });
+
+        // For loops with back-edges, iterate the loop body multiple times
+        // to build up memory state. This handles counted memory-copy loops
+        // (e.g. copying vals to a vec array) where a single pass leaves
+        // the memory incomplete when vec_new_from_linear_memory runs.
+        //
+        // We run up to MAX_LOOP_ITERS passes. On each pass, the state
+        // (locals, memory) carries forward from the previous pass, so
+        // stores accumulate. We keep the AnalyzedBlocks from the LAST
+        // iteration only (they represent the steady-state behavior).
+        if has_back_edge {
+            state.loop_depth += 1;
+
+            // First pass: capture the host call blocks.
+            let saved_blocks = std::mem::take(&mut state.blocks);
+            self.simulate_seq(func, l.seq, state, depth + 1);
+            let first_iter_blocks = std::mem::replace(
+                &mut state.blocks,
+                saved_blocks,
+            );
+
+            // Additional passes for pure memory-copy loops.
+            // A pure copy loop has no host calls, no nested loops, and
+            // short body (just load/store/arithmetic/branch). These loops
+            // copy vals from a source area to a vec array; iterating them
+            // populates all elements so vec_new_from_linear_memory works.
+            if is_pure_copy_loop(func, l.seq, &self.host_func_map) {
+                const MAX_COPY_ITERS: usize = 16;
+                for _ in 1..MAX_COPY_ITERS {
+                    let saved = std::mem::take(&mut state.blocks);
+                    self.simulate_seq(func, l.seq, state, depth + 1);
+                    state.blocks = saved;
+                }
+            }
+
+            state.loop_depth -= 1;
+
+            if !first_iter_blocks.is_empty() {
+                state.blocks.push(AnalyzedBlock::Loop {
+                    body: first_iter_blocks,
+                    has_back_edge: true,
+                });
+            }
+        } else {
+            // No back-edge: compiler artifact, process once and flatten.
+            let saved_blocks = std::mem::take(&mut state.blocks);
+            self.simulate_seq(func, l.seq, state, depth);
+            let loop_blocks = std::mem::replace(
+                &mut state.blocks,
+                saved_blocks,
+            );
+            if !loop_blocks.is_empty() {
+                state.blocks.push(AnalyzedBlock::Loop {
+                    body: loop_blocks,
+                    has_back_edge: false,
+                });
+            }
         }
     }
 
@@ -721,6 +813,7 @@ impl AnalyzedModule {
                 then_block: then_blocks,
                 else_block: else_blocks,
                 alt_unreachable,
+                guard_trap: false,
             });
         }
 
@@ -1036,6 +1129,88 @@ impl AnalyzedModule {
         if let Some((base_id, base)) = decompose_address(&addr) {
             let eff = base + store.arg.offset as i64;
             state.memory_state.insert((base_id, eff), val);
+        }
+    }
+}
+
+/// Check if a loop is a pure memory-copy loop safe to iterate.
+///
+/// A pure copy loop contains only loads, stores, local get/set, constants,
+/// arithmetic, and branches — no host calls, no nested loops, no if/else.
+/// These loops copy values between memory regions (e.g. source area → vec array)
+/// and are safe to run multiple times to populate all elements.
+fn is_pure_copy_loop(
+    func: &LocalFunction,
+    seq_id: InstrSeqId,
+    host_func_map: &HashMap<FunctionId, &'static HostFunction>,
+) -> bool {
+    let seq = func.block(seq_id);
+    // Must be short (tight copy loops are < 20 instructions)
+    if seq.instrs.len() > 25 {
+        return false;
+    }
+    for (instr, _) in &seq.instrs {
+        match instr {
+            // Safe: memory and local operations
+            Instr::Load(_) | Instr::Store(_)
+            | Instr::LocalGet(_) | Instr::LocalSet(_) | Instr::LocalTee(_)
+            | Instr::Const(_) | Instr::Binop(_) | Instr::Unop(_)
+            | Instr::Br(_) | Instr::BrIf(_) | Instr::Drop(_)
+            | Instr::GlobalGet(_) | Instr::GlobalSet(_) => {}
+            // Blocks are OK if they don't contain calls
+            Instr::Block(b) => {
+                if !is_pure_copy_loop(func, b.seq, host_func_map) {
+                    return false;
+                }
+            }
+            // Any call, loop, or if/else makes it non-pure
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Collect all block InstrSeqIds where the instruction immediately following
+/// the block is `Unreachable` (or `Call` + `Unreachable`). Any `br_if`
+/// targeting one of these blocks is a guard/precondition check — the taken
+/// path leads to a trap, so the continuation should be flat.
+fn collect_guard_blocks(func: &LocalFunction) -> HashSet<InstrSeqId> {
+    let mut guards = HashSet::new();
+    collect_guards_in_seq(func, func.entry_block(), &mut guards);
+    guards
+}
+
+fn collect_guards_in_seq(
+    func: &LocalFunction,
+    seq_id: InstrSeqId,
+    guards: &mut HashSet<InstrSeqId>,
+) {
+    let seq = func.block(seq_id);
+    let instrs = &seq.instrs;
+    for (i, (instr, _)) in instrs.iter().enumerate() {
+        match instr {
+            Instr::Block(b) => {
+                // Check if next instruction is Unreachable (direct trap)
+                let next_unreachable = instrs.get(i + 1)
+                    .map_or(false, |(next, _)| matches!(next, Instr::Unreachable(_)));
+                // Check if next is Call + Unreachable (panic handler + trap)
+                let next_call_unreachable = instrs.get(i + 1)
+                    .map_or(false, |(next, _)| matches!(next, Instr::Call(_)))
+                    && instrs.get(i + 2)
+                    .map_or(false, |(next, _)| matches!(next, Instr::Unreachable(_)));
+                if next_unreachable || next_call_unreachable {
+                    guards.insert(b.seq);
+                }
+                collect_guards_in_seq(func, b.seq, guards);
+            }
+            Instr::Loop(l) => {
+                collect_guards_in_seq(func, l.seq, guards);
+            }
+            Instr::IfElse(ie) => {
+                collect_guards_in_seq(func, ie.consequent, guards);
+                collect_guards_in_seq(func, ie.alternative, guards);
+            }
+            _ => {}
         }
     }
 }
