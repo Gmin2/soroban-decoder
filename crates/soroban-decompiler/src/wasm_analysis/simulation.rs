@@ -241,10 +241,6 @@ impl AnalyzedModule {
                     );
                     let expected = pre_len + result_count;
                     if state.stack.len() > expected {
-                        // Before draining, capture the top-of-stack as a
-                        // potential return value. This handles functions
-                        // that leave a value on the stack without an
-                        // explicit Return instruction.
                         if state.return_value.is_none() {
                             state.return_value = state.stack.last().cloned();
                         }
@@ -1056,11 +1052,11 @@ impl AnalyzedModule {
         let result =
             if let Some((lid, base)) = decompose_address(&addr) {
                 let eff = base + load.arg.offset as i64;
-                state
+                let found = state
                     .memory_state
                     .get(&(lid, eff))
-                    .cloned()
-                    .unwrap_or(StackValue::Unknown)
+                    .cloned();
+                found.unwrap_or(StackValue::Unknown)
             } else {
                 // Try to evaluate the address as a constant for data section reads.
                 self.try_load_from_data_section(&addr, load)

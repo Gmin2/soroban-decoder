@@ -1,3 +1,11 @@
+//! Scoped binding hoisting pass.
+//!
+//! WASM `br_if` patterns often place `let` bindings inside an `if` block even
+//! though the bound name is referenced by statements *outside* that block.
+//! This creates invalid Rust where a variable defined inside an `if` is used
+//! after the `if` closes. This pass detects such escaped bindings and flattens
+//! the enclosing `if` block, inlining its body into the surrounding scope.
+
 use crate::ir::Statement;
 
 use super::super::optimization::dce::collect_stmt_refs;

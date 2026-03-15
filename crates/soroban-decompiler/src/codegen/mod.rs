@@ -26,6 +26,7 @@
 mod types;
 mod emit;
 mod imports;
+pub(crate) mod helper_extractor;
 
 use anyhow::Result;
 use proc_macro2::TokenStream;
@@ -203,25 +204,47 @@ fn generate_tokens(entries: &[ScSpecEntry], analysis: Option<&AnalyzedModule>) -
         None
     };
 
+    // First pass: collect specs and IRs separately
+    let mut func_specs = Vec::new();
     for entry in entries {
         match entry {
             ScSpecEntry::FunctionV0(f) => {
-                let fn_name = f.name.to_utf8_string_lossy();
                 let body_ir = analysis.and_then(|a| pattern_recognizer::recognize(a, f, entries));
-                if is_account_contract && fn_name == "__check_auth" {
-                    trait_fns.push(emit::gen_trait_function(f, body_ir.as_ref()));
-                } else {
-                    regular_fns.push(emit::gen_function(f, body_ir.as_ref()));
-                }
-                if let Some(ir) = body_ir {
-                    body_irs.push(ir);
-                }
+                func_specs.push((f, body_ir));
             }
             ScSpecEntry::UdtStructV0(s) => type_defs.push(types::gen_struct(s)),
             ScSpecEntry::UdtUnionV0(u) => type_defs.push(types::gen_union(u)),
             ScSpecEntry::UdtEnumV0(e) => type_defs.push(types::gen_enum(e)),
             ScSpecEntry::UdtErrorEnumV0(e) => type_defs.push(types::gen_error_enum(e)),
             ScSpecEntry::EventV0(e) => type_defs.push(types::gen_event(e)),
+        }
+    }
+
+    // Extract helper functions from repeated storage patterns across all bodies
+    let mut all_irs: Vec<_> = func_specs.iter()
+        .filter_map(|(_, ir)| ir.clone())
+        .collect();
+    let helpers = helper_extractor::extract_helpers(&mut all_irs);
+    let helper_fn_tokens: Vec<TokenStream> = helpers.iter()
+        .map(helper_extractor::gen_helper_tokens)
+        .collect();
+
+    // Build a map from function name to (possibly modified) IR
+    let mut ir_map: std::collections::HashMap<String, crate::ir::FunctionIR> = all_irs.into_iter()
+        .map(|ir| (ir.name.clone(), ir))
+        .collect();
+
+    // Generate function tokens with modified IRs
+    for (f, _) in &func_specs {
+        let fn_name = f.name.to_utf8_string_lossy();
+        let body_ir = ir_map.remove(&fn_name);
+        if is_account_contract && fn_name == "__check_auth" {
+            trait_fns.push(emit::gen_trait_function(f, body_ir.as_ref()));
+        } else {
+            regular_fns.push(emit::gen_function(f, body_ir.as_ref()));
+        }
+        if let Some(ir) = body_ir {
+            body_irs.push(ir);
         }
     }
 
@@ -266,6 +289,8 @@ fn generate_tokens(entries: &[ScSpecEntry], analysis: Option<&AnalyzedModule>) -
 
             #(#type_defs)*
 
+            #(#helper_fn_tokens)*
+
             #[contract]
             pub struct Contract;
 
@@ -290,6 +315,8 @@ fn generate_tokens(entries: &[ScSpecEntry], analysis: Option<&AnalyzedModule>) -
             #(#extra_use_stmts)*
 
             #(#type_defs)*
+
+            #(#helper_fn_tokens)*
 
             #[contract]
             pub struct Contract;

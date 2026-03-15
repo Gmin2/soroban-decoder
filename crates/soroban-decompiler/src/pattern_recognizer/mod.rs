@@ -25,6 +25,13 @@
 //! - [`val_decoding`] -- Soroban Val encoding/decoding, symbol resolution,
 //!   and expression resolution from stack values to IR expressions
 //! - [`optimization`] -- CSE, DCE, and variable renaming passes
+//! - [`guard_analysis`] -- guard/comparison classification helpers
+//! - [`error_branches`] -- error branch reconstruction for Result-returning fns
+//! - [`loop_patterns`] -- loop body pattern recognition (vec iteration, ranges)
+//! - [`token_fix`] -- token address void fix
+//! - [`param_subst`] -- parameter pass-through substitution
+//! - [`event_recognition`] -- event struct pattern matching
+//! - [`storage_keys`] -- storage key resolution and tuple key synthesis
 
 use std::collections::HashMap;
 
@@ -36,6 +43,13 @@ use crate::wasm_analysis::{AnalyzedBlock, AnalyzedModule, StackValue, TrackedHos
 pub mod host_calls;
 pub mod val_decoding;
 pub mod optimization;
+mod guard_analysis;
+mod error_branches;
+mod loop_patterns;
+mod token_fix;
+mod param_subst;
+mod event_recognition;
+mod storage_keys;
 
 pub use val_decoding::{
     strip_val_boilerplate, extract_u32_val, decode_keys_from_linear_memory,
@@ -129,7 +143,7 @@ pub fn recognize(
     if let Some(ret_val) = &effective_return {
         let stripped = strip_val_boilerplate(ret_val);
         let ret_expr = val_decoding::resolve_arg(&stripped, &param_names, &call_result_names);
-        if should_emit_return_expr(&ret_expr) {
+        if guard_analysis::should_emit_return_expr(&ret_expr) {
             statements.push(Statement::Return(Some(ret_expr)));
         }
     }
@@ -165,6 +179,11 @@ pub fn recognize(
     // and the has()/get() pattern is exposed at the correct nesting level.
     statements = optimization::hoist_scoped_bindings(statements);
 
+    // Synthesize DataKey tuple keys: when storage operations use
+    // `vec![&env, Symbol::new("Variant"), param]` as keys, replace with
+    // `DataKey::Variant(param)` enum variants.
+    statements = storage_keys::synthesize_tuple_keys(statements, all_entries);
+
     // Re-run CSE after hoisting: guard folding and hoisting may expose
     // duplicate bindings that were previously hidden inside nested if blocks
     // (e.g. duplicate Symbol::new("Counter") or DataKey::Counter(user)).
@@ -174,22 +193,51 @@ pub fn recognize(
     // all references to x with y (including dotted paths like x.field).
     statements = optimization::eliminate_identity_bindings(statements);
 
+    // Increment pattern: transform `let val = .get().unwrap_or(0);
+    // .set(&key, &(val + 1))` into `let mut count = ...; count += 1;
+    // .set(&key, &count)`.
+    statements = optimization::reconstruct_increment_pattern(statements);
+
+    // Struct field mutation: transform `let val = get(); let s = Struct { f: val.f + X };
+    // set(&key, &s)` into `let mut state = get(); state.f += X; set(&key, &state)`.
+    statements = optimization::reconstruct_struct_mutation(statements);
+
+    // Split cross-contract client chains into two statements:
+    // `client::new(&env, &addr).method(args)` →
+    // `let client = client::new(&env, &addr); client.method(args)`
+    // Must run BEFORE inline_single_use_bindings to avoid re-merging.
+    statements = optimization::split_client_calls(statements);
+
+    // Inline single-use bindings: collapse `let x = expr; x.method()`
+    // into `expr.method()` when x is used only once as a receiver.
+    // Note: skips `client` bindings produced by split_client_calls since
+    // the client is used once — we need the inline pass to NOT merge them back.
+    statements = optimization::inline_single_use_bindings(statements);
+
+    // Normalize integer comparisons: `x < 6` → `x <= 5`, etc.
+    statements = optimization::normalize_comparisons(statements);
+
+    // Event struct recognition: transform raw `env.events().publish(args, data)`
+    // into `EventStruct { field: data }.publish(&env)` when a matching event
+    // spec entry exists.
+    statements = event_recognition::recognize_event_structs(statements, all_entries);
+
     // Run DCE again after all optimization passes.
     statements = optimization::eliminate_dead_vars(statements);
 
     // Struct field pass-through: when a struct literal has a field of the
     // same type as a function parameter, substitute the parameter reference
     // instead of the (potentially incorrect) reconstructed value.
-    statements = substitute_param_pass_through(statements, spec, all_entries);
+    statements = param_subst::substitute_param_pass_through(statements, spec, all_entries);
 
     // Storage key resolution: when a storage operation uses an unresolved
     // key (Default::default() or local_N), try to match it against the
     // contract's enum variants using the constructor call's constant arg.
-    statements = resolve_storage_keys(statements, all_entries);
+    statements = storage_keys::resolve_storage_keys(statements, all_entries);
 
     // Fix void token addresses: when token::Client::new(&env, &()) appears
     // and a preceding storage-loaded struct has a "token" field, use it.
-    statements = fix_void_token_addresses(statements);
+    statements = token_fix::fix_void_token_addresses(statements);
 
     // Re-run DCE: the substitution and key resolution passes may have
     // orphaned bindings (e.g. time_bound_1 replaced by time_bound).
@@ -202,7 +250,7 @@ pub fn recognize(
     let is_result = spec.outputs.to_option()
         .map_or(false, |t| matches!(t, ScSpecTypeDef::Result(_)));
     if is_result {
-        statements = reconstruct_error_branches(statements, all_entries);
+        statements = error_branches::reconstruct_error_branches(statements, all_entries);
     }
 
     if statements.is_empty() {
@@ -213,82 +261,6 @@ pub fn recognize(
         name: export_name,
         body: statements,
     })
-}
-
-/// Reconstruct error branches in Result-returning functions.
-///
-/// Detects the WASM default-then-override pattern where `local = Error; if (ok) { ...; local = Ok; } return local;`
-/// was flattened to `If { cond, then: [side_effects], else: [] }; Return(val)` because the error
-/// value was lost during simulation. Moves the Return into the if-then body and adds an Err return
-/// to the else branch.
-fn reconstruct_error_branches(stmts: Vec<Statement>, all_entries: &[ScSpecEntry]) -> Vec<Statement> {
-    // Find the first error enum variant value for the Err branch.
-    let first_error_val = all_entries.iter().find_map(|e| {
-        if let ScSpecEntry::UdtErrorEnumV0(err) = e {
-            err.cases.first().map(|c| c.value)
-        } else {
-            None
-        }
-    });
-    let error_val = match first_error_val {
-        Some(v) => v,
-        None => return stmts, // No error enum defined, nothing to do
-    };
-
-    let n = stmts.len();
-    if n < 2 {
-        return stmts;
-    }
-
-    // Look for the pattern: If { cond, then: [has side effects], else: [] } followed by Return(val)
-    let last_idx = n - 1;
-    let penult_idx = n - 2;
-
-    let is_pattern = matches!(
-        (&stmts[penult_idx], &stmts[last_idx]),
-        (
-            Statement::If { else_body, .. },
-            Statement::Return(Some(_))
-        ) if else_body.is_empty()
-    );
-
-    if !is_pattern {
-        return stmts;
-    }
-
-    // Check that the if-then body has side effects (storage write, event publish, etc.)
-    // to distinguish from read-only guards that shouldn't get error branches.
-    let has_side_effects = if let Statement::If { then_body, .. } = &stmts[penult_idx] {
-        then_body.iter().any(|s| matches!(s, Statement::Expr(_)))
-    } else {
-        false
-    };
-
-    if !has_side_effects {
-        return stmts;
-    }
-
-    // Reconstruct: move Return into if-then, add Err return to else
-    let mut result: Vec<Statement> = stmts[..penult_idx].to_vec();
-    let return_stmt = stmts[last_idx].clone();
-
-    if let Statement::If { condition, then_body, .. } = &stmts[penult_idx] {
-        let mut new_then = then_body.clone();
-        new_then.push(return_stmt);
-
-        let error_placeholder = format!("__contract_error_{}", error_val);
-        let else_body = vec![
-            Statement::Return(Some(Expr::Var(error_placeholder))),
-        ];
-
-        result.push(Statement::If {
-            condition: condition.clone(),
-            then_body: new_then,
-            else_body,
-        });
-    }
-
-    result
 }
 
 /// Pre-decode string/symbol literals from the WASM data section.
@@ -535,9 +507,9 @@ fn build_statements_from_blocks(
                     // Decode U32Val-space comparison constants. The WASM
                     // compiler generates `result < (N << 32)` for fast
                     // length checks without decoding the U32Val.
-                    let cond_expr = decode_val_comparison_constants(cond_expr);
+                    let cond_expr = guard_analysis::decode_val_comparison_constants(cond_expr);
 
-                    let is_user_precondition = is_user_comparison(&cond_expr);
+                    let is_user_precondition = guard_analysis::is_user_comparison(&cond_expr);
 
                     if is_user_precondition {
                         stmts.push(Statement::If {
@@ -610,7 +582,7 @@ fn build_statements_from_blocks(
                 let body_stmts =
                     build_statements_from_blocks(body, ctx);
                 if *has_back_edge {
-                    if let Some(loop_stmt) = try_recognize_loop_pattern(body, &body_stmts, ctx) {
+                    if let Some(loop_stmt) = loop_patterns::try_recognize_loop_pattern(body, &body_stmts, ctx) {
                         stmts.push(loop_stmt);
                         continue;
                     }
@@ -623,777 +595,6 @@ fn build_statements_from_blocks(
     }
 
     stmts
-}
-
-/// Try to recognize a structured loop pattern from analyzed blocks and their
-/// already-built statements.
-///
-/// Detects two patterns:
-/// 1. **Vec iteration**: body contains `vec_len(v)` and `vec_get(v, i)` calls
-///    → emits `ForEach { var_name: "item", collection: v, body }`
-/// 2. **Range iteration**: body contains arithmetic accumulation with a counter
-///    → emits `ForRange { var_name: "i", bound, body }`
-///
-/// Falls back to `None` if no pattern is recognized.
-fn try_recognize_loop_pattern(
-    analyzed_body: &[AnalyzedBlock],
-    body_stmts: &[Statement],
-    ctx: &RecognitionContext,
-) -> Option<Statement> {
-    // Scan analyzed blocks for vec_len and vec_get host calls.
-    let mut vec_len_collection: Option<Expr> = None;
-    let mut vec_get_var: Option<String> = None;
-    let mut has_vec_get = false;
-
-    for block in analyzed_body {
-        if let AnalyzedBlock::HostCall(call) = block {
-            match call.host_func.name {
-                "vec_len" => {
-                    // The first arg to vec_len is the vec being iterated.
-                    if let Some(arg) = call.args.first() {
-                        let stripped = val_decoding::strip_val_boilerplate(arg);
-                        let expr = val_decoding::resolve_arg(
-                            &stripped,
-                            &ctx.param_names,
-                            &ctx.call_result_names,
-                        );
-                        vec_len_collection = Some(expr);
-                    }
-                }
-                "vec_get" => {
-                    has_vec_get = true;
-                    // The result name for vec_get is the loop variable.
-                    if let Some(name) = ctx.call_result_names.get(&call.call_site_id) {
-                        vec_get_var = Some(name.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Recurse into nested if/else blocks inside the loop.
-        scan_loop_body_nested(block, ctx, &mut vec_len_collection, &mut vec_get_var, &mut has_vec_get);
-    }
-
-    if let Some(collection) = vec_len_collection {
-        let filtered_body: Vec<Statement> = body_stmts.iter()
-            .filter(|s| !is_vec_iteration_boilerplate(s))
-            .cloned()
-            .collect();
-
-        if has_vec_get {
-            // Pattern 1: vec iteration (vec_len + vec_get)
-            let var_name = vec_get_var.unwrap_or_else(|| "item".to_string());
-            return Some(Statement::ForEach {
-                var_name,
-                collection,
-                body: filtered_body,
-            });
-        } else {
-            // Pattern 2: range loop — vec_len without vec_get means `for i in 0..len`
-            return Some(Statement::ForRange {
-                var_name: "i".to_string(),
-                bound: collection,
-                body: filtered_body,
-            });
-        }
-    }
-
-    None
-}
-
-/// Recursively scan nested blocks inside a loop body for vec_len/vec_get calls.
-fn scan_loop_body_nested(
-    block: &AnalyzedBlock,
-    ctx: &RecognitionContext,
-    vec_len_collection: &mut Option<Expr>,
-    vec_get_var: &mut Option<String>,
-    has_vec_get: &mut bool,
-) {
-    match block {
-        AnalyzedBlock::If { then_block, else_block, .. } => {
-            for b in then_block.iter().chain(else_block.iter()) {
-                if let AnalyzedBlock::HostCall(call) = b {
-                    match call.host_func.name {
-                        "vec_len" => {
-                            if vec_len_collection.is_none() {
-                                if let Some(arg) = call.args.first() {
-                                    let stripped = val_decoding::strip_val_boilerplate(arg);
-                                    let expr = val_decoding::resolve_arg(
-                                        &stripped,
-                                        &ctx.param_names,
-                                        &ctx.call_result_names,
-                                    );
-                                    *vec_len_collection = Some(expr);
-                                }
-                            }
-                        }
-                        "vec_get" => {
-                            *has_vec_get = true;
-                            if vec_get_var.is_none() {
-                                if let Some(name) = ctx.call_result_names.get(&call.call_site_id) {
-                                    *vec_get_var = Some(name.clone());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                scan_loop_body_nested(b, ctx, vec_len_collection, vec_get_var, has_vec_get);
-            }
-        }
-        AnalyzedBlock::Loop { body, .. } => {
-            for b in body {
-                if let AnalyzedBlock::HostCall(call) = b {
-                    match call.host_func.name {
-                        "vec_len" => {
-                            if vec_len_collection.is_none() {
-                                if let Some(arg) = call.args.first() {
-                                    let stripped = val_decoding::strip_val_boilerplate(arg);
-                                    let expr = val_decoding::resolve_arg(
-                                        &stripped,
-                                        &ctx.param_names,
-                                        &ctx.call_result_names,
-                                    );
-                                    *vec_len_collection = Some(expr);
-                                }
-                            }
-                        }
-                        "vec_get" => {
-                            *has_vec_get = true;
-                            if vec_get_var.is_none() {
-                                if let Some(name) = ctx.call_result_names.get(&call.call_site_id) {
-                                    *vec_get_var = Some(name.clone());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                scan_loop_body_nested(b, ctx, vec_len_collection, vec_get_var, has_vec_get);
-            }
-        }
-        AnalyzedBlock::HostCall(_) => {}
-    }
-}
-
-/// Decode Val-encoded comparison constants in guard conditions.
-///
-/// The WASM compiler generates fast comparisons like `result < (1 << 32)`
-/// to check U32Val-encoded lengths without decoding. This function detects
-/// large constants (> 2^31) in comparisons and decodes them by shifting
-/// right 32 bits (extracting the U32Val value portion).
-fn decode_val_comparison_constants(expr: Expr) -> Expr {
-    use crate::ir::BinOp as B;
-    match expr {
-        Expr::BinOp { op: op @ (B::Lt | B::Le | B::Gt | B::Ge | B::Eq | B::Ne), left, right } => {
-            let new_left = decode_large_literal(*left);
-            let new_right = decode_large_literal(*right);
-            Expr::BinOp { op, left: Box::new(new_left), right: Box::new(new_right) }
-        }
-        other => other,
-    }
-}
-
-/// If an expression is a large I64 literal that looks like a Val-encoded
-/// constant (value > 2^31 with meaningful upper 32 bits), decode it.
-fn decode_large_literal(expr: Expr) -> Expr {
-    match &expr {
-        Expr::Literal(crate::ir::Literal::I64(v)) => {
-            let uv = *v as u64;
-            // U32Val-space threshold: value >= 2^32, decode upper 32 bits
-            if uv >= (1u64 << 32) && uv <= (u32::MAX as u64) << 32 | 0xFFFFFFFF {
-                let decoded = (uv >> 32) as i64;
-                // Only decode if the result is a reasonable small number
-                if decoded >= 0 && decoded <= 1000 {
-                    return Expr::Literal(crate::ir::Literal::I64(decoded));
-                }
-            }
-        }
-        _ => {}
-    }
-    expr
-}
-
-/// Check if an expression is a user-level comparison suitable for
-/// a precondition guard (`if cond { panic!() }`).
-///
-/// A user comparison is a relational operator (Lt, Le, Gt, Ge, Eq, Ne)
-/// where both sides reference named variables (Var), not raw literals
-/// or compiler-generated artifacts like bit shifts.
-fn is_user_comparison(expr: &Expr) -> bool {
-    use crate::ir::BinOp as B;
-    match expr {
-        // Direct comparison: amount <= 0, val < share_amount, len > 10
-        Expr::BinOp { op: B::Lt | B::Le | B::Gt | B::Ge | B::Eq | B::Ne, left, right } => {
-            (has_named_var(left) || has_named_var(right))
-                && !is_type_tag_check_expr(expr)
-                && !is_overflow_check_expr(expr)
-                && !is_arithmetic_overflow_check(expr)
-        }
-        // Method call result used as bool guard: claimants.is_empty()
-        Expr::MethodChain { .. } if has_named_var(expr) => true,
-        // Host call / helper result used as bool guard: is_initialized()
-        Expr::HostCall { .. } => true,
-        // Negated expression: !check_time_bound(...)
-        Expr::UnOp { op: crate::ir::UnOp::Not, operand } => is_user_comparison(operand),
-        _ => false,
-    }
-}
-
-/// Detect compiler-generated arithmetic overflow checks.
-///
-/// Pattern: `(a + b) < a` or `(a + b) < b` — generated by the compiler
-/// for `checked_add` (which Soroban uses for all `+=` operations).
-/// Also: `a < (a - b)` for underflow checks on subtraction.
-fn is_arithmetic_overflow_check(expr: &Expr) -> bool {
-    use crate::ir::BinOp as B;
-    match expr {
-        // (a + b) < a  or  (a + b) < b
-        Expr::BinOp { op: B::Lt, left, right } => {
-            if let Expr::BinOp { op: B::Add, left: add_l, right: add_r } = left.as_ref() {
-                // (a + b) < a — left operand of addition matches right of comparison
-                if format!("{:?}", add_l) == format!("{:?}", right)
-                    || format!("{:?}", add_r) == format!("{:?}", right) {
-                    return true;
-                }
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-/// Check if an expression tree contains at least one named variable
-/// (Var that's not a raw/computed placeholder).
-fn has_named_var(expr: &Expr) -> bool {
-    match expr {
-        Expr::Var(name) => !name.starts_with("local_") && !name.starts_with("/*"),
-        Expr::BinOp { left, right, .. } => has_named_var(left) || has_named_var(right),
-        Expr::UnOp { operand, .. } => has_named_var(operand),
-        Expr::Ref(inner) => has_named_var(inner),
-        _ => false,
-    }
-}
-
-/// Check if an expression is a Soroban type tag check.
-///
-/// Pattern: `(expr & 0xFF) != constant` or `(expr & 255) != constant`.
-/// These are generated by the SDK to validate Val type tags at runtime
-/// and should be stripped during decompilation.
-fn is_type_tag_check_expr(expr: &Expr) -> bool {
-    use crate::ir::BinOp as B;
-    match expr {
-        // (x & 255) != N  or  (x & 255) == N
-        Expr::BinOp { op: B::Ne | B::Eq, left, .. } => {
-            matches!(left.as_ref(),
-                Expr::BinOp { op: B::BitAnd, right, .. }
-                if matches!(right.as_ref(),
-                    Expr::Literal(crate::ir::Literal::I64(255))
-                    | Expr::Literal(crate::ir::Literal::I32(255))
-                )
-            )
-        }
-        _ => false,
-    }
-}
-
-/// Check if an expression is an i128 decode/conversion check.
-///
-/// Pattern: `literal == literal` or `literal != literal` where both are
-/// small integer constants — these come from i128 decoder helpers checking
-/// return status. Handles both I32 and I64 literal types.
-fn is_decode_check_expr(expr: &Expr) -> bool {
-    use crate::ir::BinOp as B;
-    match expr {
-        Expr::BinOp { op: B::Eq | B::Ne, left, right } => {
-            let is_small_const = |e: &Expr| match e {
-                Expr::Literal(crate::ir::Literal::I32(v)) => v.unsigned_abs() <= 32,
-                Expr::Literal(crate::ir::Literal::I64(v)) => v.unsigned_abs() <= 32,
-                _ => false,
-            };
-            is_small_const(left) && is_small_const(right)
-        }
-        _ => false,
-    }
-}
-
-/// Check if an expression is an overflow guard from i128 arithmetic.
-///
-/// Pattern: `((a >> 63) ^ (b >> 63)) & (...) < 0` — generated by the
-/// compiler for i128 subtraction overflow detection.
-fn is_overflow_check_expr(expr: &Expr) -> bool {
-    use crate::ir::BinOp as B;
-    // Top-level: something < 0
-    if let Expr::BinOp { op: B::Lt, right, left, .. } = expr {
-        let is_zero = matches!(right.as_ref(),
-            Expr::Literal(crate::ir::Literal::I64(0))
-            | Expr::Literal(crate::ir::Literal::I32(0))
-        );
-        if is_zero && contains_shr63(left) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Recursively check if an expression contains `>> 63` shifts
-/// (characteristic of i128 overflow detection).
-fn contains_shr63(expr: &Expr) -> bool {
-    use crate::ir::BinOp as B;
-    match expr {
-        Expr::BinOp { op: B::Shr, right, .. } => {
-            matches!(right.as_ref(),
-                Expr::Literal(crate::ir::Literal::I64(63))
-                | Expr::Literal(crate::ir::Literal::I32(63))
-            ) || contains_shr63(right)
-        }
-        Expr::BinOp { left, right, .. } => {
-            contains_shr63(left) || contains_shr63(right)
-        }
-        Expr::UnOp { operand, .. } => contains_shr63(operand),
-        _ => false,
-    }
-}
-
-/// Check if a statement is boilerplate from the vec iteration pattern
-/// (vec_len let-binding that was absorbed into the for-each/for-range header).
-///
-/// Only removes `len*` bindings — NOT `item*` bindings, which carry the
-/// actual loop variable data used in the loop body.
-fn is_vec_iteration_boilerplate(stmt: &Statement) -> bool {
-    match stmt {
-        Statement::Let { name, .. } => {
-            name == "len" || name.starts_with("len_")
-        }
-        _ => false,
-    }
-}
-
-/// Decide whether a resolved return expression is worth emitting.
-///
-/// Filters out noise like `/* computed */`, `/* unknown */`, `/* void */`
-/// but allows named variables, literals, and operations through.
-fn should_emit_return_expr(expr: &Expr) -> bool {
-    match expr {
-        Expr::Raw(s) => {
-            // Suppress void, unknown, computed placeholders
-            !s.contains("void") && !s.contains("unknown") && !s.contains("computed")
-        }
-        Expr::Literal(_) | Expr::Var(_) | Expr::MethodChain { .. }
-        | Expr::BinOp { .. } | Expr::UnOp { .. } | Expr::HostCall { .. }
-        | Expr::MacroCall { .. } | Expr::StructLiteral { .. }
-        | Expr::EnumVariant { .. } | Expr::Ref(_) => true,
-    }
-}
-
-/// Fix void token addresses in token::Client::new(&env, &()) calls.
-///
-/// When the token address resolves to () (from untracked struct field access),
-/// look for a preceding storage-loaded struct variable that has a "token" field
-/// and substitute `var.token`.
-fn fix_void_token_addresses(stmts: Vec<Statement>) -> Vec<Statement> {
-    // Find the name of a storage-loaded struct variable.
-    let mut storage_var: Option<String> = None;
-    for stmt in &stmts {
-        if let Statement::Let { name, value, .. } = stmt {
-            // Pattern: let val = env.storage().*.get(&key).unwrap_or_default()
-            if let Expr::MethodChain { calls, .. } = value {
-                let has_get = calls.iter().any(|c| c.name == "get");
-                let has_unwrap = calls.iter().any(|c| c.name.starts_with("unwrap"));
-                if has_get && has_unwrap {
-                    storage_var = Some(name.clone());
-                }
-            }
-        }
-    }
-
-    let Some(var_name) = storage_var else {
-        return stmts;
-    };
-
-    // Replace &() with &var.token in token::Client::new calls
-    stmts.into_iter().map(|stmt| {
-        fix_void_token_in_stmt(stmt, &var_name)
-    }).collect()
-}
-
-fn fix_void_token_in_stmt(stmt: Statement, var_name: &str) -> Statement {
-    match stmt {
-        Statement::Let { name, mutable, value } => Statement::Let {
-            name, mutable, value: fix_void_token_in_expr(value, var_name),
-        },
-        Statement::Expr(e) => Statement::Expr(fix_void_token_in_expr(e, var_name)),
-        Statement::If { condition, then_body, else_body } => Statement::If {
-            condition,
-            then_body: then_body.into_iter().map(|s| fix_void_token_in_stmt(s, var_name)).collect(),
-            else_body: else_body.into_iter().map(|s| fix_void_token_in_stmt(s, var_name)).collect(),
-        },
-        other => other,
-    }
-}
-
-fn fix_void_token_in_expr(expr: Expr, var_name: &str) -> Expr {
-    match expr {
-        // Match: token::Client::new(&env, &())
-        Expr::MethodChain { receiver, calls } => {
-            let new_receiver = if let Expr::HostCall { module, name, args } = receiver.as_ref() {
-                if module == "token::Client" && name == "new" {
-                    // Check if second arg is &() (void)
-                    let is_void_addr = args.get(1).map_or(false, |a| matches!(a,
-                        Expr::Ref(inner) if matches!(inner.as_ref(), Expr::Literal(crate::ir::Literal::Unit))
-                    ));
-                    if is_void_addr {
-                        let mut new_args = args.clone();
-                        new_args[1] = Expr::Ref(Box::new(
-                            Expr::Var(format!("{}.token", var_name)),
-                        ));
-                        Some(Box::new(Expr::HostCall {
-                            module: module.clone(),
-                            name: name.clone(),
-                            args: new_args,
-                        }))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            Expr::MethodChain {
-                receiver: new_receiver.unwrap_or(receiver),
-                calls,
-            }
-        }
-        other => other,
-    }
-}
-
-/// Substitute struct literal fields with function parameters when the types match.
-///
-/// When the original code does `ClaimableBalance { time_bound, ... }` passing
-/// a parameter directly, the WASM unpacks and repacks it through memory.
-/// Our simulation may reconstruct the fields incorrectly. This pass detects
-/// the pattern and substitutes the parameter reference.
-fn substitute_param_pass_through(
-    stmts: Vec<Statement>,
-    spec: &ScSpecFunctionV0,
-    all_entries: &[ScSpecEntry],
-) -> Vec<Statement> {
-    // Build a map of param_name → type_name for UDT (struct/enum) params.
-    let param_types: Vec<(String, String)> = spec.inputs.iter().filter_map(|input| {
-        if let ScSpecTypeDef::Udt(udt) = &input.type_ {
-            Some((input.name.to_utf8_string_lossy(), udt.name.to_utf8_string_lossy()))
-        } else {
-            None
-        }
-    }).collect();
-
-    if param_types.is_empty() {
-        return stmts;
-    }
-
-    // Collect struct type names defined in the spec.
-    let struct_names: std::collections::HashSet<String> = all_entries.iter().filter_map(|e| {
-        if let ScSpecEntry::UdtStructV0(s) = e {
-            Some(s.name.to_utf8_string_lossy())
-        } else {
-            None
-        }
-    }).collect();
-
-    stmts.into_iter().map(|stmt| {
-        substitute_pass_through_stmt(stmt, &param_types, &struct_names)
-    }).collect()
-}
-
-fn substitute_pass_through_stmt(
-    stmt: Statement,
-    param_types: &[(String, String)],
-    struct_names: &std::collections::HashSet<String>,
-) -> Statement {
-    match stmt {
-        // When a Let binding creates a struct literal, check if any field
-        // references a reconstructed struct that could be a parameter.
-        Statement::Let { name, mutable, value } => Statement::Let {
-            name,
-            mutable,
-            value: substitute_pass_through_expr(value, param_types, struct_names),
-        },
-        Statement::Expr(e) => Statement::Expr(
-            substitute_pass_through_expr(e, param_types, struct_names),
-        ),
-        Statement::If { condition, then_body, else_body } => Statement::If {
-            condition,
-            then_body: then_body.into_iter()
-                .map(|s| substitute_pass_through_stmt(s, param_types, struct_names))
-                .collect(),
-            else_body: else_body.into_iter()
-                .map(|s| substitute_pass_through_stmt(s, param_types, struct_names))
-                .collect(),
-        },
-        other => other,
-    }
-}
-
-fn substitute_pass_through_expr(
-    expr: Expr,
-    param_types: &[(String, String)],
-    struct_names: &std::collections::HashSet<String>,
-) -> Expr {
-    match expr {
-        Expr::StructLiteral { name, fields } => {
-            // For each field: if the field's type matches a struct AND there's
-            // a function parameter of that struct type with a matching name,
-            // replace the field value with the parameter reference.
-            let new_fields: Vec<(String, Expr)> = fields.into_iter().map(|(field_name, field_val)| {
-                // Check if this field references a reconstructed struct
-                // that could be replaced by a parameter.
-                if let Expr::Var(ref var_name) = field_val {
-                    // The var might be "time_bound_1" referencing a Let binding
-                    // that builds a struct. Check if there's a param with the
-                    // base name and matching struct type.
-                    let base = var_name.trim_end_matches(|c: char| c == '_' || c.is_ascii_digit());
-                    for (param_name, param_type) in param_types {
-                        if (base == param_name || &field_name == param_name)
-                            && struct_names.contains(param_type)
-                        {
-                            return (field_name, Expr::Var(param_name.clone()));
-                        }
-                    }
-                }
-                // Also handle the case where the field value is clearly wrong
-                // (a variable of a completely different type is used for a
-                // struct-typed field). Check by field name matching a param.
-                for (param_name, param_type) in param_types {
-                    if &field_name == param_name && struct_names.contains(param_type) {
-                        // Field name matches a parameter name and the param
-                        // is a struct type → use the parameter.
-                        return (field_name, Expr::Var(param_name.clone()));
-                    }
-                }
-                (field_name, substitute_pass_through_expr(field_val, param_types, struct_names))
-            }).collect();
-            Expr::StructLiteral { name, fields: new_fields }
-        }
-        other => other,
-    }
-}
-
-/// Resolve unresolved storage keys to enum variants.
-///
-/// When `env.storage().set(&local_N, &val)` or `env.storage().set(&Default::default(), &val)`
-/// appears, try to match the key against the contract's DataKey enum.
-/// Detection: scan for storage set/get calls with Var("local_*") or
-/// Raw("Default::default()") keys, and replace with the appropriate
-/// DataKey::Variant based on the position/usage pattern.
-fn resolve_storage_keys(
-    stmts: Vec<Statement>,
-    all_entries: &[ScSpecEntry],
-) -> Vec<Statement> {
-    // Find enum types that look like storage keys (variants without tuple data,
-    // matching the pattern "DataKey", "Key", etc.)
-    let key_enum = all_entries.iter().find_map(|e| {
-        if let ScSpecEntry::UdtUnionV0(u) = e {
-            let name = u.name.to_utf8_string_lossy();
-            // Common storage key enum patterns
-            if name.contains("Key") || name.contains("DataKey") {
-                let variants: Vec<String> = u.cases.iter().map(|c| match c {
-                    stellar_xdr::curr::ScSpecUdtUnionCaseV0::VoidV0(v) => v.name.to_utf8_string_lossy(),
-                    stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) => t.name.to_utf8_string_lossy(),
-                }).collect();
-                return Some((name, variants));
-            }
-        }
-        // Also check plain enums (not unions)
-        if let ScSpecEntry::UdtEnumV0(e) = e {
-            let name = e.name.to_utf8_string_lossy();
-            if name.contains("Key") || name.contains("DataKey") {
-                let variants: Vec<String> = e.cases.iter()
-                    .map(|c| c.name.to_utf8_string_lossy())
-                    .collect();
-                return Some((name, variants));
-            }
-        }
-        None
-    });
-
-    let Some((enum_name, variants)) = key_enum else {
-        return stmts;
-    };
-
-    // Collect variable names that are already bound to enum variants.
-    // These are correctly resolved and should NOT be replaced.
-    let mut resolved_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for stmt in &stmts {
-        if let Statement::Let { name, value, .. } = stmt {
-            if matches!(value, Expr::EnumVariant { enum_name: en, .. } if en == &enum_name) {
-                resolved_vars.insert(name.clone());
-            }
-        }
-    }
-
-    let mut key_to_variant: HashMap<String, usize> = HashMap::new();
-    let mut next_substantive = variants.iter().position(|v| !v.to_lowercase().contains("init")).unwrap_or(0);
-    let mut next_marker = variants.iter().position(|v| v.to_lowercase().contains("init")).unwrap_or(0);
-
-    stmts.into_iter().map(|stmt| {
-        resolve_key_in_stmt(stmt, &enum_name, &variants, &mut key_to_variant,
-            &mut next_substantive, &mut next_marker, &resolved_vars)
-    }).collect()
-}
-
-fn resolve_key_in_stmt(
-    stmt: Statement,
-    enum_name: &str,
-    variants: &[String],
-    key_map: &mut HashMap<String, usize>,
-    next_sub: &mut usize,
-    next_mark: &mut usize,
-    resolved_vars: &std::collections::HashSet<String>,
-) -> Statement {
-    match stmt {
-        // Look for storage set/get with unresolved keys
-        Statement::Expr(ref expr) | Statement::Let { value: ref expr, .. } => {
-            if let Some(resolved) = try_resolve_key_in_method_chain(expr, enum_name, variants, key_map, next_sub, next_mark, resolved_vars) {
-                match stmt {
-                    Statement::Expr(_) => Statement::Expr(resolved),
-                    Statement::Let { name, mutable, .. } => Statement::Let { name, mutable, value: resolved },
-                    _ => unreachable!(),
-                }
-            } else {
-                stmt
-            }
-        }
-        Statement::If { condition, then_body, else_body } => Statement::If {
-            condition,
-            then_body: then_body.into_iter()
-                .map(|s| resolve_key_in_stmt(s, enum_name, variants, key_map, next_sub, next_mark, resolved_vars))
-                .collect(),
-            else_body: else_body.into_iter()
-                .map(|s| resolve_key_in_stmt(s, enum_name, variants, key_map, next_sub, next_mark, resolved_vars))
-                .collect(),
-        },
-        other => other,
-    }
-}
-
-fn try_resolve_key_in_method_chain(
-    expr: &Expr,
-    enum_name: &str,
-    variants: &[String],
-    key_map: &mut HashMap<String, usize>,
-    next_sub: &mut usize,
-    next_mark: &mut usize,
-    resolved_vars: &std::collections::HashSet<String>,
-) -> Option<Expr> {
-    if let Expr::MethodChain { receiver, calls } = expr {
-        // Find the storage operation in the chain. It might not be the
-        // last call due to .unwrap_or_default() / .unwrap() suffixes.
-        let storage_op_idx = calls.iter().position(|c| {
-            (c.name == "set" || c.name == "get" || c.name == "has" || c.name == "remove")
-                && !c.args.is_empty()
-        });
-        let is_storage_op = calls.first().map_or(false, |c| c.name == "storage")
-            && storage_op_idx.is_some();
-
-        if is_storage_op {
-            let op_idx = storage_op_idx.unwrap();
-            let storage_call = &calls[op_idx];
-            if let Some(key_arg) = storage_call.args.first() {
-                // A storage key is "unresolved" if it's NOT already
-                // a correctly reconstructed enum variant. Since we know
-                // the contract has a DataKey enum, any key that isn't an
-                // EnumVariant of that enum needs resolution.
-                let is_already_resolved = match key_arg {
-                    Expr::Ref(inner) => match inner.as_ref() {
-                        Expr::EnumVariant { enum_name: en, .. } => en == enum_name,
-                        // Variable that was bound to an enum variant
-                        Expr::Var(name) => resolved_vars.contains(name),
-                        _ => false,
-                    },
-                    Expr::EnumVariant { enum_name: en, .. } => en == enum_name,
-                    Expr::Var(name) => resolved_vars.contains(name),
-                    _ => false,
-                };
-                let is_unresolved = !is_already_resolved;
-
-                if !is_unresolved {
-                    return None;
-                }
-
-                // Try to pick the best variant:
-                // - For .set() with a struct value: pick a variant that sounds
-                //   like the value type (e.g., "Balance" for ClaimableBalance)
-                // - For .set() with () value: pick a marker variant ("Init")
-                // - Otherwise: pick first unused variant
-                let val_arg = if storage_call.name == "set" {
-                    storage_call.args.get(1)
-                } else {
-                    None
-                };
-
-                let is_void_value = val_arg.map_or(false, |v| matches!(v,
-                    Expr::Ref(inner) if matches!(inner.as_ref(), Expr::Literal(crate::ir::Literal::Unit))
-                ));
-
-                // Create a key signature from the unresolved expression
-                // so the same key expression gets the same variant.
-                let key_sig = format!("{:?}", key_arg);
-
-                // For remove operations, prefer to reuse the variant from
-                // the most recent get/has on the same storage tier — you
-                // typically remove what you just loaded.
-                let reuse_last = if storage_call.name == "remove" && !key_map.is_empty() {
-                    key_map.values().last().copied()
-                } else {
-                    None
-                };
-
-                // `has` operations peek at the next variant without consuming it.
-                // They check existence of the same key that a subsequent get/set uses.
-                let is_peek = storage_call.name == "has";
-
-                let idx = if let Some(&existing) = key_map.get(&key_sig) {
-                    existing
-                } else if let Some(last_idx) = reuse_last {
-                    last_idx
-                } else if is_void_value {
-                    // Void value → pick marker-sounding variant
-                    let idx = *next_mark;
-                    if !is_peek { *next_mark = (*next_mark + 1).min(variants.len()); }
-                    idx
-                } else {
-                    // Struct/value → pick substantive variant
-                    let idx = *next_sub;
-                    if !is_peek { *next_sub = (*next_sub + 1).min(variants.len()); }
-                    idx
-                };
-                key_map.insert(key_sig, idx);
-
-                if idx < variants.len() {
-                    let key_expr = Expr::EnumVariant {
-                        enum_name: enum_name.to_string(),
-                        variant_name: variants[idx].clone(),
-                        fields: vec![],
-                    };
-
-                    let mut new_calls = calls.clone();
-                    let target = &mut new_calls[op_idx];
-                    if !target.args.is_empty() {
-                        target.args[0] = Expr::Ref(Box::new(key_expr));
-                    }
-
-                    return Some(Expr::MethodChain {
-                        receiver: receiver.clone(),
-                        calls: new_calls,
-                    });
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Extract parameter names from a spec function.

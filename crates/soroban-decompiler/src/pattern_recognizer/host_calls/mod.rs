@@ -382,12 +382,41 @@ pub fn recognize_call(
                     let s = String::from_utf8_lossy(&bytes);
                     Expr::Literal(crate::ir::Literal::Str(format!("b\"{}\"", s)))
                 }
-                Some(bytes) if bytes.len() <= 64 => {
+                Some(bytes) if bytes.len() <= 64 && !bytes.is_empty() => {
                     // Short binary data: emit as &[0x01, 0x02, ...]
                     let hex: Vec<String> = bytes.iter().map(|b| format!("0x{:02x}", b)).collect();
                     Expr::Raw(format!("&[{}]", hex.join(", ")))
                 }
-                _ => Expr::Raw("/* memory slice */".into()),
+                Some(_) => {
+                    // Long binary data: emit Bytes::new instead of
+                    // from_slice with an unreadable 64+ byte array.
+                    return Some(Statement::Let {
+                        name: crn.get(&call.call_site_id).cloned().unwrap_or_else(|| "bytes_val".into()),
+                        mutable: false,
+                        value: Expr::MethodChain {
+                            receiver: Box::new(Expr::Var("Bytes".into())),
+                            calls: vec![crate::ir::MethodCall {
+                                name: "new".into(),
+                                args: vec![Expr::Var("&env".into())],
+                            }],
+                        },
+                    });
+                }
+                _ => {
+                    // Can't extract byte data — emit Bytes::new(&env) instead
+                    // of Bytes::from_slice(&env, Default::default()).
+                    return Some(Statement::Let {
+                        name: crn.get(&call.call_site_id).cloned().unwrap_or_else(|| "bytes_val".into()),
+                        mutable: false,
+                        value: Expr::MethodChain {
+                            receiver: Box::new(Expr::Var("Bytes".into())),
+                            calls: vec![crate::ir::MethodCall {
+                                name: "new".into(),
+                                args: vec![Expr::Var("&env".into())],
+                            }],
+                        },
+                    });
+                }
             };
             Some(Statement::Let {
                 name: crn.get(&call.call_site_id).cloned().unwrap_or_else(|| "bytes_val".into()),

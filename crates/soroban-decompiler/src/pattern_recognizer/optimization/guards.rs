@@ -1,10 +1,26 @@
-use crate::ir::{Expr, Statement};
+//! Constant guard folding and comparison normalization.
+//!
+//! WASM `br_if` instructions produce many `if` statements with conditions
+//! that are compile-time constants, type-tag validation checks, or non-boolean
+//! expressions (which are invalid in Rust). This pass identifies and folds
+//! these artifact guards by inlining their bodies. It also normalizes
+//! off-by-one integer comparisons (`x < N+1` to `x <= N`) to match idiomatic
+//! Rust style.
 
-/// Fold `if` statements with constant boolean conditions.
+use crate::ir::{BinOp, Expr, Literal, Statement};
+
+/// Fold `if` statements whose conditions are compile-time resolvable artifacts.
 ///
-/// - `if (1) { body }` -> inline body (1 = true)
-/// - `if (0) { body } else { else_body }` -> inline else_body (0 = false)
-/// - Recurse into nested statements.
+/// Handles five categories of artifact conditions:
+/// - **Constant booleans**: `if (1) { body }` inlines body; `if (0) { ... } else { e }` inlines `e`.
+/// - **Type tag checks**: `if ((x & 255) == 77) { body }` — Soroban Val encoding validation,
+///   redundant when parameters are already typed.
+/// - **Constant comparisons**: `if (0 == 16) { body }` — frame pointer offset artifacts.
+/// - **Non-boolean conditions**: `if (val + 1) { body }` — WASM `br_if` truthiness tests
+///   that are invalid in Rust (only when no else branch).
+/// - **Unit literals**: `if (()) { body }` — unresolvable continuations treated as always-true.
+///
+/// Recurses into nested blocks (while, loop, for-each, for-range).
 pub fn fold_constant_guards(stmts: Vec<Statement>) -> Vec<Statement> {
     let mut result = Vec::new();
     for stmt in stmts {
@@ -163,6 +179,76 @@ fn is_raw_constant(expr: &Expr) -> bool {
         | Expr::Literal(crate::ir::Literal::I64(_))
     )
 }
+
+/// Normalize integer comparisons with off-by-one constants to idiomatic form.
+///
+/// Rewrites `x < N` to `x <= (N-1)` when N >= 2, matching the idiomatic Rust
+/// patterns that developers typically write. Only transforms strict-less-than
+/// with positive constants to avoid pathological cases like `x < 1` becoming
+/// `x <= 0`. Recurses into all statement and expression positions.
+pub fn normalize_comparisons(stmts: Vec<Statement>) -> Vec<Statement> {
+    stmts.into_iter().map(|stmt| normalize_cmp_in_stmt(stmt)).collect()
+}
+
+fn normalize_cmp_in_stmt(stmt: Statement) -> Statement {
+    match stmt {
+        Statement::If { condition, then_body, else_body } => Statement::If {
+            condition: normalize_cmp_expr(condition),
+            then_body: normalize_comparisons(then_body),
+            else_body: normalize_comparisons(else_body),
+        },
+        Statement::Let { name, mutable, value } => Statement::Let {
+            name, mutable,
+            value: normalize_cmp_expr(value),
+        },
+        Statement::Expr(e) => Statement::Expr(normalize_cmp_expr(e)),
+        Statement::Return(Some(e)) => Statement::Return(Some(normalize_cmp_expr(e))),
+        other => other,
+    }
+}
+
+fn normalize_cmp_expr(expr: Expr) -> Expr {
+    match expr {
+        // x < N (where N > 0) → x <= (N-1)
+        Expr::BinOp { op: BinOp::Lt, left, right } => {
+            if let Some(n) = as_positive_i64(&right) {
+                return Expr::BinOp {
+                    op: BinOp::Le,
+                    left: Box::new(normalize_cmp_expr(*left)),
+                    right: Box::new(Expr::Literal(Literal::I64(n - 1))),
+                };
+            }
+            Expr::BinOp { op: BinOp::Lt, left, right }
+        }
+        // Keep > as-is — many originals use > directly
+        Expr::BinOp { op: BinOp::Gt, left, right } => Expr::BinOp {
+            op: BinOp::Gt,
+            left: Box::new(normalize_cmp_expr(*left)),
+            right: Box::new(normalize_cmp_expr(*right)),
+        },
+        // Recurse into sub-expressions
+        Expr::BinOp { op, left, right } => Expr::BinOp {
+            op,
+            left: Box::new(normalize_cmp_expr(*left)),
+            right: Box::new(normalize_cmp_expr(*right)),
+        },
+        Expr::UnOp { op, operand } => Expr::UnOp {
+            op,
+            operand: Box::new(normalize_cmp_expr(*operand)),
+        },
+        other => other,
+    }
+}
+
+/// Return the i64 value if >= 2, so `< 6` → `<= 5` but NOT `< 1` → `<= 0`.
+fn as_positive_i64(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::I64(n)) if *n >= 2 => Some(*n),
+        Expr::Literal(Literal::I32(n)) if *n >= 2 => Some(*n as i64),
+        _ => None,
+    }
+}
+
 
 /// Detect non-boolean if-conditions that are WASM br_if artifacts.
 ///

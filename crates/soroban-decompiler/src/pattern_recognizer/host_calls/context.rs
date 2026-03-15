@@ -132,6 +132,27 @@ pub(super) fn recognize_cross_contract_call(
         });
     }
 
+    // Try to emit as a typed client call: Client::new(&env, &addr).method(&args)
+    if let Some(method_name) = extract_symbol_name(&func) {
+        let vec_args = extract_vec_call_args(call.args.get(2)?, ctx, param_names, crn);
+        let client_call = Expr::MethodChain {
+            receiver: Box::new(Expr::HostCall {
+                module: "contract_client".into(),
+                name: "new".into(),
+                args: vec![Expr::Var("&env".into()), addr.clone()],
+            }),
+            calls: vec![MethodCall {
+                name: method_name.clone(),
+                args: vec_args.iter().map(|a| as_ref(a.clone())).collect(),
+            }],
+        };
+        return Some(Statement::Let {
+            name: "result".into(),
+            mutable: false,
+            value: client_call,
+        });
+    }
+
     Some(Statement::Let {
         name: "result".into(),
         mutable: false,
@@ -164,6 +185,21 @@ fn extract_token_method_name(func_expr: &Expr) -> Option<&'static str> {
                 None
             }
         }
+        _ => None,
+    }
+}
+
+/// Extract the string value from a symbol_short!("name") expression.
+fn extract_symbol_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::MacroCall { name, args } if name == "symbol_short" => {
+            if let Some(Expr::Literal(crate::ir::Literal::Str(s))) = args.first() {
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        Expr::Literal(crate::ir::Literal::Str(s)) => Some(s.clone()),
         _ => None,
     }
 }

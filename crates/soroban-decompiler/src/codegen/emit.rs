@@ -396,6 +396,11 @@ pub(super) fn gen_expr(expr: &ir::Expr) -> TokenStream {
         }
         ir::Expr::HostCall { module, name, args } => {
             let arg_tokens: Vec<TokenStream> = args.iter().map(gen_expr).collect();
+            // Free function call (extracted helper): empty module
+            if module.is_empty() {
+                let fn_ident = format_ident!("{}", name);
+                return quote! { #fn_ident(#(#arg_tokens),*) };
+            }
             // Support path-style modules like "token::Client"
             if module.contains("::") {
                 let path: TokenStream = module.parse().unwrap_or_else(|_| {
@@ -439,8 +444,21 @@ pub(super) fn gen_expr(expr: &ir::Expr) -> TokenStream {
                 ir::BinOp::Le => quote! { <= },
                 ir::BinOp::Gt => quote! { > },
                 ir::BinOp::Ge => quote! { >= },
+                ir::BinOp::AddAssign => quote! { += },
             };
-            quote! { (#l #op_tok #r) }
+            if matches!(op, ir::BinOp::AddAssign) {
+                // Compound assignment: no parens, emit as statement-like expression
+                quote! { #l #op_tok #r }
+            } else if matches!(op,
+                ir::BinOp::Eq | ir::BinOp::Ne | ir::BinOp::Lt
+                | ir::BinOp::Le | ir::BinOp::Gt | ir::BinOp::Ge
+            ) {
+                // Comparison operators: no outer parens needed.
+                // Rust's `if a < b` doesn't need `if (a < b)`.
+                quote! { #l #op_tok #r }
+            } else {
+                quote! { (#l #op_tok #r) }
+            }
         }
         ir::Expr::UnOp { op, operand } => {
             let e = gen_expr(operand);
@@ -481,8 +499,18 @@ pub(super) fn gen_expr(expr: &ir::Expr) -> TokenStream {
             let e = gen_expr(inner);
             quote! { &#e }
         }
-        ir::Expr::Raw(_text) => {
-            quote! { Default::default() }
+        ir::Expr::Raw(text) => {
+            // If the Raw text starts with "&[" or other meaningful
+            // content, render it literally. Only fall back to
+            // Default::default() for placeholder comments.
+            if text.starts_with("&[") || text.starts_with("b\"") {
+                let ts: proc_macro2::TokenStream = text.parse().unwrap_or_else(|_| {
+                    quote! { Default::default() }
+                });
+                ts
+            } else {
+                quote! { Default::default() }
+            }
         }
     }
 }

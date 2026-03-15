@@ -1,3 +1,13 @@
+//! i128 arithmetic collapse pass.
+//!
+//! WASM has no native i128 type, so the Rust compiler decomposes every i128
+//! operation into sequences of i64 multiplies, adds, shifts, and masks
+//! (carry-chain arithmetic). The decompiler faithfully reconstructs these as
+//! deeply nested `BinOp` trees, which are unreadable. This pass simplifies
+//! them through three stages: algebraic identity simplification, depth-based
+//! collapse of remaining deep expressions to `/* i128 expr */` placeholders,
+//! and elimination of i128 overflow check guards.
+
 use crate::ir::{Expr, MethodCall, Statement};
 
 use super::collect_expr_var_names;

@@ -244,6 +244,8 @@ pub enum BinOp {
     Gt,
     /// Greater than or equal (`>=`).
     Ge,
+    /// Add-assign (`+=`).
+    AddAssign,
 }
 
 /// Unary operators supported in the IR.

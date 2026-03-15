@@ -33,7 +33,7 @@ pub(super) fn recognize_storage_get(
                 MethodCall { name: "storage".into(), args: vec![] },
                 MethodCall { name: tier.into(), args: vec![] },
                 MethodCall { name: "get".into(), args: vec![key_expr] },
-                MethodCall { name: "unwrap_or_default".into(), args: vec![] },
+                MethodCall { name: "unwrap_or".into(), args: vec![Expr::Literal(Literal::I64(0))] },
             ],
         },
     })
