@@ -14,5 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-decompiler = { workspace = true }
 soroban-decompiler-bench = { path = "../soroban-decompiler-bench" }
+stellar-xdr = { workspace = true }
+serde = { workspace = true }
 wasm-bindgen = "0.2"
 serde_json = { workspace = true }

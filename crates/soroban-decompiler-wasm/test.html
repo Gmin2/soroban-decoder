@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html><head><title>WASM JSON Test</title></head>
+<body>
+<pre id="o" style="background:#111;color:#eee;padding:16px;font-size:13px;white-space:pre-wrap;"></pre>
+<script type="module">
+import init, { decompile, inspect, imports, score } from './pkg/soroban_decompiler_wasm.js';
+const log = s => document.getElementById('o').textContent += s + '\n';
+
+const B64 = "AGFzbQEAAAABDAJgAn5+AX5gAX4BfgINAgFiAWkAAAF2AWcAAAMCAQEFAwEAEQYhBH8BQYCAwAALfwBBhYDAAAt/AEGFgMAAC38AQZCAwAALBzEFBm1lbW9yeQIABWhlbGxvAAIBXwMBCl9fZGF0YV9lbmQDAgtfX2hlYXBfYmFzZQMDCtIBAc8BAwF/AX4BfyOAgICAAEEgayIBJICAgIAAAkAgAEL/AYNCyQBSDQBBgIDAgACtQiCGQgSEQoSAgIDQABCAgICAACECIAEgADcDCCABIAI3AwBBACEDA0ACQCADQRBHDQBBACEDAkADQCADQRBGDQEgAUEQaiADaiABIANqKQMANwMAIANBCGohAwwACwsgAUEQaq1CIIZCBIRChICAgCAQgYCAgAAhACABQSBqJICAgIAAIAAPCyABQRBqIANqQgI3AwAgA0EIaiEDDAALCwALCw4BAEGAgMAACwVIZWxsbwBDDmNvbnRyYWN0c3BlY3YwAAAAAAAAAAAAAAAFaGVsbG8AAAAAAAABAAAAAAAAAAJ0bwAAAAAAEAAAAAEAAAPqAAAAEAAeEWNvbnRyYWN0ZW52bWV0YXYwAAAAAAAAABkAAAAAAG8OY29udHJhY3RtZXRhdjAAAAAAAAAABXJzdmVyAAAAAAAABjEuODkuMAAAAAAAAAAAAAhyc3Nka3ZlcgAAAC8yNS4xLjAjODZjNTBhMWVhNGY4N2I0MGFkZDMwNjRmZjlkZjk1Yzc1NTM1NjVjNQAAUw5jb250cmFjdG1ldGF2MAAAAAAAAAAGY2xpdmVyAAAAAAAvMjUuMS4wI2EwNDhhNTdhNzU3NjI0NThiNDg3MDUyZTAwMjFlYTcwNGE5MjZiZWUA";
+function b64(s){ const r=atob(s); const a=new Uint8Array(r.length); for(let i=0;i<r.length;i++)a[i]=r.charCodeAt(i); return a; }
+
+await init();
+const w = b64(B64);
+
+log('=== decompile ===');
+log(decompile(w));
+
+log('\n=== inspect ===');
+const sr = inspect(w);
+log('raw[0..100]: ' + sr.slice(0,100));
+try { const j = JSON.parse(sr); log('PARSE OK'); log(JSON.stringify(j,null,2)); } catch(e) { log('PARSE FAIL: '+e.message); }
+
+log('\n=== imports ===');
+const ir = imports(w);
+log('raw[0..100]: ' + ir.slice(0,100));
+try { const j = JSON.parse(ir); log('PARSE OK'); log(JSON.stringify(j,null,2)); } catch(e) { log('PARSE FAIL: '+e.message); }
+
+log('\n=== score ===');
+const orig = decompile(w);
+try { const j = JSON.parse(score(orig, orig)); log('PARSE OK: overall=' + j.overall); } catch(e) { log('FAIL: '+e.message); }
+
+log('\nDONE');
+</script>
+</body></html>
